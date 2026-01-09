@@ -1,0 +1,9 @@
+[package]
+name = "schema-generator"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libnetwork-daemon = { version = "0.1.0", path = "../libnetwork-daemon" }
+schemars = "1.2.0"
+serde_json = "1.0.148"
