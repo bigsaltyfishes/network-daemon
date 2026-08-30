@@ -5,3 +5,16 @@ members = [
     "libnetwork-daemon",
     "schema-generator"
 ]
+
+[workspace.lints.clippy]
+new_without_default = { level = "allow", priority = -1 }
+correctness = { level = "deny", priority = -1 }
+complexity = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+single_call_fn = "deny"
+useless_attribute = "deny"
+redundant_pub_crate = "deny"
+excessive_precision = "deny"
+missing_docs_in_private_items = "deny"
+absolute_paths = "deny"
+redundant_closure = "deny"

@@ -49,7 +49,7 @@ impl Ifconfig {
                 let len = bytes.len().min(dst.len());
                 unsafe {
                     std::ptr::copy_nonoverlapping(
-                        bytes.as_ptr() as *const i8,
+                        bytes.as_ptr() as *const std::ffi::c_char,
                         dst.as_mut_ptr(),
                         len,
                     );
@@ -101,13 +101,13 @@ impl Ifconfig {
 
         unsafe {
             std::ptr::copy_nonoverlapping(
-                name_bytes.as_ptr() as *const i8,
+                name_bytes.as_ptr() as *const std::ffi::c_char,
                 ifr.ifr_name.as_mut_ptr(),
                 name_len,
             );
 
             if let Some(d) = data {
-                ifr.ifr_ifru.ifru_data = d as *mut i8;
+                ifr.ifr_ifru.ifru_data = d as *mut std::ffi::c_char;
             }
 
             // SIOCIFCREATE2 value comes from ffi, cast to proper type
@@ -146,7 +146,7 @@ impl Ifconfig {
             unsafe {
                 let len = name_bytes.len().min(ifr.ifr_name.len());
                 std::ptr::copy_nonoverlapping(
-                    name_bytes.as_ptr() as *const i8,
+                    name_bytes.as_ptr() as *const std::ffi::c_char,
                     ifr.ifr_name.as_mut_ptr(),
                     len,
                 );
@@ -200,7 +200,7 @@ impl Ifconfig {
             unsafe {
                 let len = name_bytes.len().min(ifreq.ifname.len());
                 std::ptr::copy_nonoverlapping(
-                    name_bytes.as_ptr() as *const i8,
+                    name_bytes.as_ptr() as *const std::ffi::c_char,
                     ifreq.ifname.as_mut_ptr(),
                     len,
                 );
@@ -245,7 +245,7 @@ impl Ifconfig {
             unsafe {
                 let len = name_bytes.len().min(ifreq.ifname.len());
                 std::ptr::copy_nonoverlapping(
-                    name_bytes.as_ptr() as *const i8,
+                    name_bytes.as_ptr() as *const std::ffi::c_char,
                     ifreq.ifname.as_mut_ptr(),
                     len,
                 );

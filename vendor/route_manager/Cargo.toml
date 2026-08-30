@@ -1,0 +1,67 @@
+# Vendored copy of route_manager v0.2.13 (crates.io).
+#
+# Upstream: https://github.com/tun-rs/route_manager  (Apache-2.0)
+#
+# Why vendored:
+#   Upstream v0.2.13 (and current master) hardcodes `sin_zero: [0i8; 8]` in
+#   `unix_bsd/mod.rs` (the `From<Ipv4Addr> for sockaddr_in` impl). On FreeBSD
+#   aarch64 `c_char` is `u8` (on amd64 it is `i8`), so the crate fails to
+#   compile on arm64 FreeBSD. We patched it here (see the cfg'd sin_zero
+#   initializer) and will submit the fix upstream.
+#
+# Trimmed from the published manifest: crate-type reduced to "lib" (we only
+# use it as a library), dev-dependencies/examples removed.
+
+[package]
+name = "route_manager"
+version = "0.2.13"
+edition = "2021"
+license = "Apache-2.0"
+readme = "README.md"
+description = "Cross-platform route management interface"
+repository = "https://github.com/tun-rs/route_manager"
+keywords = ["route", "network", "ip"]
+
+[lib]
+crate-type = ["lib"]
+
+[dependencies]
+libc = "0.2"
+tokio = { version = "1", features = [
+    "net",
+    "macros",
+    "io-util",
+    "rt",
+], optional = true }
+async-io = { version = "2.3", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+netlink-packet-route = "0.31"
+netlink-sys = "0.8"
+netlink-packet-core = "0.8"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+flume = "0.12"
+windows-sys = { version = "0.61", features = [
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_SystemServices",
+    "Win32_Security_Cryptography",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_System_Threading",
+    "Win32_System_Com",
+    "Win32_System_Rpc",
+    "Win32_Security",
+    "Win32_Foundation",
+    "Win32_System_Ioctl",
+    "Win32_System_IO",
+    "Win32_System_LibraryLoader",
+    "Win32_Security_WinTrust",
+] }
+
+[features]
+default = []
+shutdown = []
+async = ["tokio"]
+async_io = ["async-io"]

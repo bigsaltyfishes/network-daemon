@@ -12,3 +12,30 @@
 
 // Include the generated bindings
 include!(concat!(env!("OUT_DIR"), "/freebsd.rs"));
+
+// ---------------------------------------------------------------------------
+// Missing ioctl constants.
+//
+// bindgen's `clang_macro_fallback` does not reliably resolve the `SIOC*`
+// request macros from `<sys/sockio.h>` / `<netinet6/in6_var.h>` (they are
+// `_IOWR('x', n, type)` and depend on `sizeof` of a struct), so they are not
+// always emitted into `freebsd.rs`. These are stable ABI values on FreeBSD;
+// we define the ones used by the crate directly, taken from the headers:
+//
+//   SIOCGIFFLAGS     _IOWR('i',  17, struct ifreq)    value 0xc0206911
+//   SIOCSIFFLAGS     _IOW ('i',  16, struct ifreq)    value 0x80206910
+//   SIOCIFCREATE2    _IOWR('i', 124, struct ifreq)    value 0xc020697c
+//   SIOCGIFINFO_IN6  _IOWR('i', 108, struct in6_ndireq) value 0xc048696c
+//   SIOCSIFINFO_IN6  _IOWR('i', 109, struct in6_ndireq) value 0xc048696d
+//
+// See `<sys/sockio.h>` and `<netinet6/in6_var.h>` in the FreeBSD source.
+#[allow(clippy::all)]
+pub const SIOCGIFFLAGS: libc::c_ulong = 0xc0206911;
+#[allow(clippy::all)]
+pub const SIOCSIFFLAGS: libc::c_ulong = 0x80206910;
+#[allow(clippy::all)]
+pub const SIOCIFCREATE2: libc::c_ulong = 0xc020697c;
+#[allow(clippy::all)]
+pub const SIOCGIFINFO_IN6: libc::c_ulong = 0xc048696c;
+#[allow(clippy::all)]
+pub const SIOCSIFINFO_IN6: libc::c_ulong = 0xc048696d;
