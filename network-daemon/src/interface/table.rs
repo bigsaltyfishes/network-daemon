@@ -224,6 +224,7 @@ mod tests {
             gateway_ipv4: None,
             gateway_ipv6: None,
             dhcpv4_enabled: false,
+            slaac_enabled: false,
         }
     }
 

@@ -165,6 +165,8 @@ pub enum InterfaceManagerAction {
         ipv6: Modification<PrefixedIpv6Addr>,
         #[serde(default)]
         oper_state: Modification<bool>,
+        #[serde(default)]
+        slaac: Modification<bool>,
     },
     /// DHCP Set event for an interface
     ///
@@ -258,6 +260,12 @@ pub struct InterfaceInfo {
     pub gateway_ipv6: Option<PrefixedIpv6Addr>,
     /// DHCPv4 enable flag
     pub dhcpv4_enabled: bool,
+    /// SLAAC (kernel Router Advertisement) enabled flag
+    ///
+    /// When enabled, IPv6 is configured by the FreeBSD kernel's SLAAC rather
+    /// than by the daemon.
+    #[serde(default)]
+    pub slaac_enabled: bool,
     /// Parent interface (for wlan devices)
     pub parent: Option<String>,
 }
@@ -279,6 +287,7 @@ impl InterfaceInfo {
             gateway_ipv4: None,
             gateway_ipv6: None,
             dhcpv4_enabled: true,
+            slaac_enabled: false,
             parent: None,
         }
     }

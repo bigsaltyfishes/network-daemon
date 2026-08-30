@@ -266,6 +266,7 @@ impl Message<InterfaceManagerAction> for InterfaceManager {
                 ipv4,
                 ipv6,
                 oper_state,
+                slaac,
             } => {
                 async fn mod_ip<T>(
                     info: &InterfaceInfo,
@@ -320,6 +321,16 @@ impl Message<InterfaceManagerAction> for InterfaceManager {
                     ifconfig.set_link_status(&name, state).await?;
                 }
 
+                // Apply/clear the SLAAC (kernel Router Advertisement) flag and
+                // record it on the interface so status/TUI reflect the state.
+                if let Modification::Replace(state) = slaac {
+                    let ifconfig = Ifconfig::new();
+                    ifconfig.set_slaac_state(&name, state).await?;
+                    if let Some(mut info) = self.get_interface(&name) {
+                        info.slaac_enabled = state;
+                        self.add_interface(info);
+                    }
+                }
                 Ok(InterfaceResponse::Success(()))
             }
             InterfaceManagerAction::DhcpV4Set {
