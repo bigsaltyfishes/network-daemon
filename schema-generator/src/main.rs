@@ -1,12 +1,14 @@
 use libnetwork_daemon::{
     DaemonCommand, InterfaceManagerAction, InterfaceType, LinkOptions,
-    WiFiManagerAction, WlanLinkOptions,
+    WlanLinkOptions,
 };
 use schemars::schema_for;
 
 fn main() {
-    let schema = schema_for!(DaemonCommand);
-    // println!("{}", serde_json::to_string_pretty(&schema).unwrap());
+    let _schema = schema_for!(DaemonCommand);
+    // To regenerate the command schema, uncomment:
+    // println!("{}", serde_json::to_string_pretty(&_schema).unwrap());
+
     let command = DaemonCommand::InterfaceManager {
         action: InterfaceManagerAction::AddLink {
             name: "wlan0".to_string(),

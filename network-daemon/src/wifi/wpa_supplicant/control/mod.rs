@@ -16,9 +16,11 @@ use socket::WpaSocket;
 pub const WPA_MAX_REPLY_SIZE: usize = 4096;
 
 /// Default timeout for wpa_supplicant requests
+#[allow(dead_code)] // public timeout constant
 pub const WPA_DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Timeout for scan operations
+#[allow(dead_code)] // public timeout constant
 pub const WPA_SCAN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// WPA Supplicant control interface
@@ -109,6 +111,7 @@ impl WpaCtrl {
         }
     }
 
+    #[allow(dead_code)] // control receive; used by async event loop
     pub async fn recv(&mut self) -> Result<Option<String>, WpaCtrlError> {
         let mut buf = vec![0u8; WPA_MAX_REPLY_SIZE];
         let len = self
@@ -118,7 +121,7 @@ impl WpaCtrl {
             .map_err(|e| WpaSocketError::RecvFailed(e.into()))?;
 
         if len == 0 {
-            return Ok(None);
+            Ok(None)
         } else {
             let response =
                 String::from_utf8_lossy(&buf[..len]).trim_end().to_string();

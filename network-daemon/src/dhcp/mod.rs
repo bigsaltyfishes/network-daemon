@@ -3,15 +3,13 @@ mod lease;
 mod socket;
 mod utils;
 
-use std::{collections::HashMap, ops::ControlFlow, time::Duration};
+use std::{ops::ControlFlow, time::Duration};
 
-use async_channel::Receiver;
 use kameo::{
     Actor,
     actor::{ActorId, ActorRef, Spawn, WeakActorRef},
     error::ActorStopReason,
     mailbox,
-    message::StreamMessage,
     prelude::{Context, Message},
 };
 use libnetwork_daemon::{InterfaceManagerAction, Lease, MacAddr, ignore};
@@ -52,11 +50,8 @@ impl Actor for DhcpManager {
         mut args: Self::Args,
         actor_ref: ActorRef<Self>,
     ) -> Result<Self, Self::Error> {
-        let clinet = DhcpClient::new(
-            args.iface.clone(),
-            args.mac.clone(),
-            actor_ref.clone(),
-        )?;
+        let clinet =
+            DhcpClient::new(args.iface.clone(), args.mac, actor_ref.clone())?;
 
         let client_ref =
             DhcpClient::spawn_with_mailbox(clinet, mailbox::unbounded());
@@ -79,7 +74,7 @@ impl Actor for DhcpManager {
             tokio::time::sleep(Duration::from_secs(15)).await;
             let client = DhcpClient::new(
                 self.iface.clone(),
-                self.mac.clone(),
+                self.mac,
                 actor_ref.clone(),
             )?;
 

@@ -80,6 +80,7 @@ impl NetlinkModifier {
         self.send_request(&mut packet).await
     }
 
+    #[allow(dead_code)] // route delete for RouteManager; Phase D/E wiring
     pub async fn del_route(
         &mut self,
         rt: &Route,
@@ -114,6 +115,7 @@ impl NetlinkModifier {
         }
     }
 
+    #[allow(dead_code)] // route add for RouteManager; Phase D/E wiring
     pub async fn add_route(
         &mut self,
         rt: &Route,
@@ -210,10 +212,10 @@ impl NetlinkModifier {
         let ack = NetlinkMessage::<RouteNetlinkMessage>::deserialize(&recv_buf)
             .map_err(|e| NetlinkQueryError::DecodeError(e.into()))?;
 
-        if let NetlinkPayload::Error(e) = ack.payload {
-            if let Some(e) = e.code {
-                return Err(NetlinkQueryError::NetlinkError(e.into()));
-            }
+        if let NetlinkPayload::Error(e) = ack.payload
+            && let Some(e) = e.code
+        {
+            return Err(NetlinkQueryError::NetlinkError(e.into()));
         }
         Ok(())
     }

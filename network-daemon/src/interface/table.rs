@@ -37,22 +37,22 @@ impl InterfaceTable {
 
         // Update bidirectional index mapping
         // Clean up old mappings if index or name already exists
-        if let Some(old_name) = self.index_to_name.get(&index) {
-            if old_name != &name {
-                self.name_to_index.remove(old_name);
-            }
+        if let Some(old_name) = self.index_to_name.get(&index)
+            && old_name != &name
+        {
+            self.name_to_index.remove(old_name);
         }
-        if let Some(old_index) = self.name_to_index.get(&name) {
-            if *old_index != index {
-                self.index_to_name.remove(old_index);
-            }
+        if let Some(old_index) = self.name_to_index.get(&name)
+            && *old_index != index
+        {
+            self.index_to_name.remove(old_index);
         }
         self.index_to_name.insert(index, name.clone());
         self.name_to_index.insert(name.clone(), index);
 
         // Update secondary indices
         self.by_type
-            .entry(info.interface_type.clone())
+            .entry(info.interface_type)
             .or_default()
             .insert(name.clone());
 
@@ -63,10 +63,7 @@ impl InterfaceTable {
                 .insert(name.clone());
         }
 
-        self.by_state
-            .entry(info.state.clone())
-            .or_default()
-            .insert(name);
+        self.by_state.entry(info.state).or_default().insert(name);
     }
 
     /// Remove an interface by name, cleaning up all indices
@@ -84,10 +81,10 @@ impl InterfaceTable {
             set.remove(name);
         }
 
-        if let Some(parent) = &info.parent {
-            if let Some(set) = self.by_parent.get_mut(parent) {
-                set.remove(name);
-            }
+        if let Some(parent) = &info.parent
+            && let Some(set) = self.by_parent.get_mut(parent)
+        {
+            set.remove(name);
         }
 
         if let Some(set) = self.by_state.get_mut(&info.state) {
@@ -119,16 +116,19 @@ impl InterfaceTable {
     }
 
     /// Get the ifindex for a given interface name
+    #[allow(dead_code)] // used by TUI/client lookups
     pub fn get_index(&self, name: &str) -> Option<u32> {
         self.name_to_index.get(name).copied()
     }
 
     /// Check if an interface with the given name exists
+    #[allow(dead_code)] // used by TUI/client
     pub fn contains(&self, name: &str) -> bool {
         self.interfaces.contains_key(name)
     }
 
     /// Check if an interface with the given ifindex exists
+    #[allow(dead_code)] // used by TUI/client
     pub fn contains_index(&self, index: u32) -> bool {
         self.index_to_name.contains_key(&index)
     }
@@ -191,11 +191,13 @@ impl InterfaceTable {
     }
 
     /// Get the number of interfaces
+    #[allow(dead_code)] // used by TUI/client
     pub fn len(&self) -> usize {
         self.interfaces.len()
     }
 
     /// Check if the table is empty
+    #[allow(dead_code)] // used by TUI/client
     pub fn is_empty(&self) -> bool {
         self.interfaces.is_empty()
     }

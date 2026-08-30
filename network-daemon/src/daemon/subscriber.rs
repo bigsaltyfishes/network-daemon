@@ -67,15 +67,10 @@ where
         msg: StreamMessage<T, (), ()>,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        match msg {
-            StreamMessage::Next(msg) => {
-                let response = ensure!(serde_json::to_string(&(self
-                    .response_builder)(
-                    msg
-                )));
-                ignore!(self.writer.tell(response).await);
-            }
-            _ => {}
+        if let StreamMessage::Next(msg) = msg {
+            let response =
+                ensure!(serde_json::to_string(&(self.response_builder)(msg)));
+            ignore!(self.writer.tell(response).await);
         }
     }
 }

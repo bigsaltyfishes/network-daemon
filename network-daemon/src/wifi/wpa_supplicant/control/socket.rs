@@ -14,10 +14,12 @@ pub struct WpaSocket {
     /// Unix datagram socket
     socket: UnixDatagram,
     /// Temporary directory for local socket
+    #[allow(dead_code)] // resource path held for the socket lifetime
     sock_dir: PathBuf,
     /// Local socket path
     local_path: PathBuf,
     /// Remote wpa_supplicant socket path
+    #[allow(dead_code)] // resource path held for the socket lifetime
     remote_path: PathBuf,
 }
 
@@ -71,21 +73,25 @@ impl WpaSocket {
     }
 
     /// Get reference to the underlying socket
+    #[allow(dead_code)] // socket accessor
     pub fn socket(&self) -> &UnixDatagram {
         &self.socket
     }
 
     /// Get local socket path
+    #[allow(dead_code)] // local socket path accessor
     pub fn local_path(&self) -> &Path {
         &self.local_path
     }
 
     /// Get remote socket path
+    #[allow(dead_code)] // remote socket path accessor
     pub fn remote_path(&self) -> &Path {
         &self.remote_path
     }
 
     /// Get the raw file descriptor
+    #[allow(dead_code)] // raw fd accessor
     pub fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
         self.socket.as_raw_fd()
     }

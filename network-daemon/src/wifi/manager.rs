@@ -189,7 +189,8 @@ impl<B: WifiManagerBackend> Message<WiFiManagerAction> for WifiManager<B> {
 
         if let Some(backend) = &self.backend {
             Ok(backend.ask(msg).await.map_err(|e| {
-                e.err().unwrap_or(WifiError::Other(format!("Backend Died")))
+                e.err()
+                    .unwrap_or(WifiError::Other("Backend Died".to_string()))
             })?)
         } else {
             Err(WifiError::NotSupported("Backend not available".to_string()))

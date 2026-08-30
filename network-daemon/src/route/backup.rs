@@ -3,7 +3,7 @@ use std::{
     hash::Hash,
 };
 
-use libnetwork_daemon::{InterfaceInfo, PrefixedIpv4Addr, ignore};
+use libnetwork_daemon::ignore;
 
 pub struct BackupRouteTable<I>
 where

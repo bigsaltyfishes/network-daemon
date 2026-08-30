@@ -313,8 +313,7 @@ mod tests {
 
     #[test]
     fn test_parse_state_change() {
-        let raw =
-            "<3>CTRL-EVENT-STATE-CHANGE id=0 state=COMPLETED old_state=SCANNING";
+        let raw = "<3>CTRL-EVENT-STATE-CHANGE id=0 state=COMPLETED old_state=SCANNING";
         assert_eq!(
             WpaEvent::parse(raw),
             WpaEvent::StateChange {
@@ -356,7 +355,8 @@ mod tests {
     #[test]
     fn test_parse_priority_less_connected() {
         // Some wpa_supplicant builds omit the <N> priority prefix.
-        let raw = "CTRL-EVENT-CONNECTED - Connection to 11:22:33:44:55:66 completed";
+        let raw =
+            "CTRL-EVENT-CONNECTED - Connection to 11:22:33:44:55:66 completed";
         assert_eq!(
             WpaEvent::parse(raw),
             WpaEvent::Connected {

@@ -294,9 +294,7 @@ where
                     }
                     DaemonCommand::InterfaceManager { action } => {
                         match action {
-                            InterfaceManagerAction::SubscribeEvents {
-                                ..
-                            } => {
+                            InterfaceManagerAction::SubscribeEvents => {
                                 match self
                                     .ifmgr
                                     .ask(

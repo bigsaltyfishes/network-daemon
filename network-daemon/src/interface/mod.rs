@@ -5,7 +5,6 @@ mod table;
 use std::{collections::HashSet, ops::ControlFlow};
 
 use async_channel::Receiver;
-use futures_util::FutureExt;
 use kameo::{
     Actor,
     actor::{ActorId, ActorRef, WeakActorRef},
@@ -17,7 +16,7 @@ use libnetwork_daemon::{
     ConnectionState, InterfaceInfo, InterfaceManagerAction,
     InterfaceManagerEvent, InterfaceResponse, InterfaceType, IntoPrefixed,
     LinkOptions, Modification, PrefixedIpAddr, ensure, error::InterfaceError,
-    ignore, utils::Broadcast,
+    utils::Broadcast,
 };
 use netlink_packet_core::{DecodeError, NetlinkMessage, NetlinkPayload};
 use netlink_packet_route::{RouteNetlinkMessage, link::LinkFlags};
@@ -59,10 +58,10 @@ impl InterfaceManager {
     /// Refresh the list of interfaces and their states
     pub async fn refresh_interfaces(
         &mut self,
-        actor_ref: &ActorRef<Self>,
+        _actor_ref: &ActorRef<Self>,
     ) -> Result<(), InterfaceError> {
-        let mut query = NetlinkQuery::new()
-            .map_err(|e| InterfaceError::NetlinkQueryError(e.into()))?;
+        let mut query =
+            NetlinkQuery::new().map_err(InterfaceError::NetlinkQueryError)?;
         let old_interfaces_set =
             self.table.all().into_iter().collect::<HashSet<_>>();
         let mut new_interfaces_set = HashSet::new();
@@ -70,7 +69,7 @@ impl InterfaceManager {
         query
             .query_links()
             .await
-            .map_err(|e| InterfaceError::NetlinkQueryError(e.into()))?
+            .map_err(InterfaceError::NetlinkQueryError)?
             .into_values()
             .for_each(|v| {
                 new_interfaces_set.insert(v.clone());
@@ -405,10 +404,10 @@ impl Message<InterfaceManagerAction> for InterfaceManager {
                         Ok(InterfaceResponse::Success(()))
                     }
                     InterfaceManagerEvent::InterfaceRemoved(info) => {
-                        if let Err(e) = self.remove_interface(&info.name) {
-                            if !matches!(e, InterfaceError::NotFound(_)) {
-                                return Err(e);
-                            }
+                        if let Err(e) = self.remove_interface(&info.name)
+                            && !matches!(e, InterfaceError::NotFound(_))
+                        {
+                            return Err(e);
                         }
                         Ok(InterfaceResponse::Success(()))
                     }
@@ -422,7 +421,7 @@ impl Message<InterfaceManagerAction> for InterfaceManager {
                             {
                                 // The state of wireless interfaces is managed
                                 // externally
-                                info.state = current_info.state.clone();
+                                info.state = current_info.state;
                             }
 
                             // TODO: Check whether the gateway is in the same

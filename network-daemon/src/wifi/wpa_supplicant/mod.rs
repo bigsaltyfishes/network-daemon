@@ -116,6 +116,7 @@ impl WpaSupplicant {
     /// # Arguments
     ///
     /// * `enable` - true for passive scan, false for active scan
+    #[allow(dead_code)] // control method; not yet bound to a WiFiManagerAction
     pub async fn set_passive_scan(
         &mut self,
         enable: bool,
@@ -171,6 +172,7 @@ impl WpaSupplicant {
     }
 
     /// Get a specific network value
+    #[allow(dead_code)] // helper; used by later phases to read network config
     async fn get_network_value(
         &mut self,
         nwid: i32,
@@ -243,6 +245,7 @@ impl WpaSupplicant {
     }
 
     /// Disable a network
+    #[allow(dead_code)] // control method; used for network dis/abling
     pub async fn disable_network(
         &mut self,
         nwid: i32,
@@ -259,6 +262,7 @@ impl WpaSupplicant {
     ///
     /// * `nwid` - Network ID
     /// * `enable` - true to enable auto-connect, false to disable
+    #[allow(dead_code)] // control method; not yet bound to a WiFiManagerAction
     pub async fn set_autoconnect(
         &mut self,
         nwid: i32,
@@ -277,6 +281,7 @@ impl WpaSupplicant {
     ///
     /// * `nwid` - Network ID
     /// * `priority` - Priority value (higher = preferred)
+    #[allow(dead_code)] // control method; used by later TUI phase
     pub async fn set_priority(
         &mut self,
         nwid: i32,
@@ -376,7 +381,6 @@ impl WpaSupplicant {
         password: Option<&str>,
         identity: Option<&str>,
         hidden: bool,
-        enable: bool,
     ) -> Result<i32, WifiError> {
         let nwid = self.add_network().await?;
 
@@ -386,11 +390,11 @@ impl WpaSupplicant {
             return Err(e);
         }
 
-        if let Some(bssid) = bssid {
-            if let Err(e) = self.configure_bssid(nwid, &bssid).await {
-                let _ = self.remove_network(nwid).await;
-                return Err(e);
-            }
+        if let Some(bssid) = bssid
+            && let Err(e) = self.configure_bssid(nwid, &bssid).await
+        {
+            let _ = self.remove_network(nwid).await;
+            return Err(e);
         }
 
         // Configure security
@@ -421,32 +425,26 @@ impl WpaSupplicant {
         }
 
         // Configure hidden if needed
-        if hidden {
-            if let Err(e) = self.configure_hidden(nwid).await {
-                let _ = self.remove_network(nwid).await;
-                return Err(e);
-            }
+        if hidden && let Err(e) = self.configure_hidden(nwid).await {
+            let _ = self.remove_network(nwid).await;
+            return Err(e);
         }
 
-        // Enable the network
-        if enable {
-            if let Err(e) = self.enable_network(nwid).await {
-                return Err(e);
-            }
-        }
+        // Enable the network. Newly configured networks are always enabled.
+        self.enable_network(nwid).await?;
 
         Ok(nwid)
     }
 
     /// Unregister a known network from wpa_supplicant
     async fn unregister_wpa_network(&mut self, known: &KnownNetwork) {
-        if let Some(nwid) = known.id {
-            if let Err(e) = self.remove_network(nwid).await {
-                warn!(
-                    "failed to remove stale wpa_supplicant network {}: {}",
-                    nwid, e
-                );
-            }
+        if let Some(nwid) = known.id
+            && let Err(e) = self.remove_network(nwid).await
+        {
+            warn!(
+                "failed to remove stale wpa_supplicant network {}: {}",
+                nwid, e
+            );
         }
     }
 
@@ -476,13 +474,12 @@ impl WpaSupplicant {
                     });
                 }
             }
-            Security::Eap => {
-                if identity.is_none() {
-                    return Err(WifiError::NotSupported(
-                        "EAP requires identity during registration".to_string(),
-                    ));
-                }
+            Security::Eap if identity.is_none() => {
+                return Err(WifiError::NotSupported(
+                    "EAP requires identity during registration".to_string(),
+                ));
             }
+            Security::Eap => {}
             _ => {}
         }
 
@@ -700,7 +697,6 @@ impl WpaSupplicant {
                 known.password.as_deref(),
                 known.identity.as_deref(),
                 known.hidden,
-                true,
             )
             .await?;
 
@@ -737,12 +733,11 @@ impl WpaSupplicant {
         let mut status = SupplicantStatus::parse(&response);
 
         // If freq is missing or 0, try to get it from BSS info
-        if status.freq.unwrap_or(0) == 0 {
-            if let Some(bssid) = &status.bssid {
-                if let Ok(Some(freq)) = self.get_bss_freq(bssid).await {
-                    status.freq = Some(freq);
-                }
-            }
+        if status.freq.unwrap_or(0) == 0
+            && let Some(bssid) = &status.bssid
+            && let Ok(Some(freq)) = self.get_bss_freq(bssid).await
+        {
+            status.freq = Some(freq);
         }
 
         Ok(status)
@@ -770,6 +765,7 @@ impl WpaSupplicant {
     }
 
     /// Save configuration to file
+    #[allow(dead_code)] // control method; needed for config persistence
     pub async fn save_config(&mut self) -> Result<(), WifiError> {
         self.ctrl_cmd
             .request_ok(&WpaCommand::SaveConfig)
@@ -778,6 +774,7 @@ impl WpaSupplicant {
     }
 
     /// Reload configuration from file
+    #[allow(dead_code)] // control method; reloads supplicant config
     pub async fn reconfigure(&mut self) -> Result<(), WifiError> {
         self.ctrl_cmd
             .request_ok(WpaCommand::Reconfigure)
@@ -832,13 +829,10 @@ impl Message<StreamMessage<WiFiManagerAction, (), ()>> for WpaSupplicant {
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let actor_ref = ctx.actor_ref();
-        match msg {
-            StreamMessage::Next(action) => {
-                if let Err(e) = actor_ref.tell(action).await {
-                    error!("Failed to forward action to self: {}", e);
-                }
-            }
-            _ => {}
+        if let StreamMessage::Next(action) = msg
+            && let Err(e) = actor_ref.tell(action).await
+        {
+            error!("Failed to forward action to self: {}", e);
         }
     }
 }
@@ -887,7 +881,7 @@ impl Message<WiFiManagerAction> for WpaSupplicant {
                             .supervisor
                             .tell(WiFiManagerEvent::StatusUpdated {
                                 iface: self.iface.clone(),
-                                status: status.clone(),
+                                status: Box::new(status.clone()),
                             })
                             .send()
                             .await;
@@ -947,7 +941,7 @@ impl Message<WiFiManagerAction> for WpaSupplicant {
                                 .supervisor
                                 .tell(WiFiManagerEvent::StatusUpdated {
                                     iface: self.iface.clone(),
-                                    status,
+                                    status: Box::new(status),
                                 })
                                 .send()
                                 .await;
@@ -995,15 +989,12 @@ impl Message<StreamMessage<std::process::ExitStatus, (), ()>>
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let actor_ref = ctx.actor_ref();
-        match msg {
-            StreamMessage::Next(status) => {
-                error!(
-                    "WPA Supplicant for iface {} exited with status: {}",
-                    self.iface, status
-                );
-                actor_ref.kill();
-            }
-            _ => {}
+        if let StreamMessage::Next(status) = msg {
+            error!(
+                "WPA Supplicant for iface {} exited with status: {}",
+                self.iface, status
+            );
+            actor_ref.kill();
         }
     }
 }

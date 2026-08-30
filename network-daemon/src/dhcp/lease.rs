@@ -1,4 +1,4 @@
-use std::{net::Ipv4Addr, pin::Pin, time::Duration};
+use std::{pin::Pin, time::Duration};
 
 use futures_lite::{Stream, stream};
 use kameo::{
@@ -21,19 +21,20 @@ pub enum LeaseEvent {
     LeaseExpired,
 }
 
+/// Handle to the renewal/rebinding/expiry timer stream.
+type TimerHandle = AbortOnDropHandle<
+    Result<
+        Pin<Box<dyn Stream<Item = usize> + Send>>,
+        SendError<StreamMessage<usize, (), ()>>,
+    >,
+>;
+
 pub struct LeaseWatchdog {
     renewal_time_val: u32,
     rebinding_time_val: u32,
     lease_time_val: u32,
     client_ref: ActorRef<DhcpClient>,
-    timer_handle: Option<
-        AbortOnDropHandle<
-            Result<
-                Pin<Box<dyn Stream<Item = usize> + Send>>,
-                SendError<StreamMessage<usize, (), ()>>,
-            >,
-        >,
-    >,
+    timer_handle: Option<TimerHandle>,
 }
 
 impl LeaseWatchdog {
@@ -108,52 +109,49 @@ impl Message<StreamMessage<usize, (), ()>> for LeaseWatchdog {
         msg: StreamMessage<usize, (), ()>,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        match msg {
-            StreamMessage::Next(event) => {
-                let instant = Instant::now();
-                info!("LeaseWatchdog: Timer event {} at {:?}", event, instant);
-                let new_times = match event {
-                    0 => {
-                        info!("Lease Renewal time reached");
-                        self.client_ref.ask(LeaseEvent::Renewal).await
-                    }
-                    1 => {
-                        info!("Lease Rebinding time reached");
-                        self.client_ref.ask(LeaseEvent::Rebinding).await
-                    }
-                    2 => {
-                        info!("Lease Expired");
-                        self.client_ref.ask(LeaseEvent::LeaseExpired).await
-                    }
-                    _ => return,
-                };
+        if let StreamMessage::Next(event) = msg {
+            let instant = Instant::now();
+            info!("LeaseWatchdog: Timer event {} at {:?}", event, instant);
+            let new_times = match event {
+                0 => {
+                    info!("Lease Renewal time reached");
+                    self.client_ref.ask(LeaseEvent::Renewal).await
+                }
+                1 => {
+                    info!("Lease Rebinding time reached");
+                    self.client_ref.ask(LeaseEvent::Rebinding).await
+                }
+                2 => {
+                    info!("Lease Expired");
+                    self.client_ref.ask(LeaseEvent::LeaseExpired).await
+                }
+                _ => return,
+            };
 
-                match new_times {
-                    Ok((renewal, rebinding, lease)) => {
-                        self.renewal_time_val = renewal;
-                        self.rebinding_time_val = rebinding;
-                        self.lease_time_val = lease;
-                        self.set_timers(ctx.actor_ref()).await;
+            match new_times {
+                Ok((renewal, rebinding, lease)) => {
+                    self.renewal_time_val = renewal;
+                    self.rebinding_time_val = rebinding;
+                    self.lease_time_val = lease;
+                    self.set_timers(ctx.actor_ref()).await;
+                }
+                Err(e) => match e.unwrap_err() {
+                    DhcpClientError::ServerRejected => {
+                        warn!(
+                            "LeaseWatchdog: Lease operation rejected by \
+                             server"
+                        );
+                        ctx.actor_ref().kill();
                     }
-                    Err(e) => match e.unwrap_err() {
-                        DhcpClientError::ServerRejected => {
-                            warn!(
-                                "LeaseWatchdog: Lease operation rejected by \
-                                 server"
-                            );
-                            ctx.actor_ref().kill();
-                        }
-                        e => {
-                            info!(
-                                "LeaseWatchdog: Lease operation failed: {:?}, \
-                                 waiting for next timeout.",
-                                e
-                            );
-                        }
-                    },
-                };
-            }
-            _ => {}
+                    e => {
+                        info!(
+                            "LeaseWatchdog: Lease operation failed: {:?}, \
+                             waiting for next timeout.",
+                            e
+                        );
+                    }
+                },
+            };
         }
     }
 }

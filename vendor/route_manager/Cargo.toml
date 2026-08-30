@@ -24,6 +24,9 @@ keywords = ["route", "network", "ip"]
 
 [lib]
 crate-type = ["lib"]
+# Vendored upstream doctests are not runnable as-is (they assume a full
+# application harness); skip them so `cargo test` on dependents stays clean.
+doctest = false
 
 [dependencies]
 libc = "0.2"

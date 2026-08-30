@@ -28,7 +28,7 @@ impl RouteTable {
         match &route.destination() {
             IpAddr::V4(addr) => {
                 let oif = route.if_index().unwrap();
-                let addr = PrefixedIpv4Addr::new(addr.clone(), route.prefix());
+                let addr = PrefixedIpv4Addr::new(*addr, route.prefix());
                 self.v4.entry(addr.clone()).or_default().insert(route);
                 self.by_oif
                     .entry(oif)
@@ -37,7 +37,7 @@ impl RouteTable {
             }
             IpAddr::V6(addr) => {
                 let oif = route.if_index().unwrap();
-                let addr = PrefixedIpv6Addr::new(addr.clone(), route.prefix());
+                let addr = PrefixedIpv6Addr::new(*addr, route.prefix());
                 self.v6.entry(addr.clone()).or_default().insert(route);
                 self.by_oif
                     .entry(oif)
@@ -50,33 +50,33 @@ impl RouteTable {
     pub fn remove(&mut self, addr: &PrefixedIpAddr) -> Option<Route> {
         match addr {
             PrefixedIpAddr::V4(inner) => {
-                if let Some(rt_set) = self.v4.get_mut(inner) {
-                    if let Some(rt) = rt_set.iter().next().cloned() {
-                        let oif = rt.if_index().unwrap();
-                        rt_set.remove(&rt);
-                        self.by_oif.get_mut(&oif).map(|set| set.remove(addr));
+                if let Some(rt_set) = self.v4.get_mut(inner)
+                    && let Some(rt) = rt_set.iter().next().cloned()
+                {
+                    let oif = rt.if_index().unwrap();
+                    rt_set.remove(&rt);
+                    self.by_oif.get_mut(&oif).map(|set| set.remove(addr));
 
-                        if self.v4.get(inner).unwrap().is_empty() {
-                            self.v4.remove(inner);
-                        }
-
-                        return Some(rt);
+                    if self.v4.get(inner).unwrap().is_empty() {
+                        self.v4.remove(inner);
                     }
+
+                    return Some(rt);
                 }
             }
             PrefixedIpAddr::V6(inner) => {
-                if let Some(rt_set) = self.v6.get_mut(inner) {
-                    if let Some(rt) = rt_set.iter().next().cloned() {
-                        let oif = rt.if_index().unwrap();
-                        rt_set.remove(&rt);
-                        self.by_oif.get_mut(&oif).map(|set| set.remove(addr));
+                if let Some(rt_set) = self.v6.get_mut(inner)
+                    && let Some(rt) = rt_set.iter().next().cloned()
+                {
+                    let oif = rt.if_index().unwrap();
+                    rt_set.remove(&rt);
+                    self.by_oif.get_mut(&oif).map(|set| set.remove(addr));
 
-                        if self.v6.get(inner).unwrap().is_empty() {
-                            self.v6.remove(inner);
-                        }
-
-                        return Some(rt);
+                    if self.v6.get(inner).unwrap().is_empty() {
+                        self.v6.remove(inner);
                     }
+
+                    return Some(rt);
                 }
             }
         }
@@ -84,6 +84,7 @@ impl RouteTable {
         None
     }
 
+    #[allow(dead_code)] // used by RouteManager dead-route cleanup
     pub fn remove_by_oif(
         &mut self,
         oif: u32,
@@ -99,6 +100,7 @@ impl RouteTable {
         None
     }
 
+    #[allow(dead_code)] // used by default-route handling
     pub fn remove_default_route(&mut self, v6: bool) -> Option<Route> {
         if v6 {
             self.remove(&PrefixedIpAddr::V6(PrefixedIpv6Addr::UNSPECIFIED))
@@ -144,18 +146,22 @@ impl RouteTable {
         })
     }
 
+    #[allow(dead_code)] // route enumeration; Phase D test
     pub fn v4_routes(&self) -> impl Iterator<Item = &Route> {
         self.v4.values().flatten()
     }
 
+    #[allow(dead_code)] // route enumeration; Phase D test
     pub fn v6_routes(&self) -> impl Iterator<Item = &Route> {
         self.v6.values().flatten()
     }
 
+    #[allow(dead_code)] // route enumeration; TUI/status
     pub fn all_routes(&self) -> impl Iterator<Item = &Route> {
         self.v4.values().flatten().chain(self.v6.values().flatten())
     }
 
+    #[allow(dead_code)] // table reset
     pub fn clear(&mut self) {
         self.v4.clear();
         self.v6.clear();

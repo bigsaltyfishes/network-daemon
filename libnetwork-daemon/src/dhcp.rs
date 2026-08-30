@@ -139,10 +139,7 @@ mod tests {
             .add_dns_server(Ipv4Addr::new(8, 8, 4, 4))
             .build()
             .unwrap();
-        assert_eq!(
-            lease.router,
-            Some(Ipv4Addr::new(192, 168, 1, 1))
-        );
+        assert_eq!(lease.router, Some(Ipv4Addr::new(192, 168, 1, 1)));
         assert_eq!(lease.dns_servers.len(), 2);
     }
 }

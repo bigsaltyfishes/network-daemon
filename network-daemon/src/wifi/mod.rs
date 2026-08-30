@@ -24,12 +24,15 @@ pub const PSK_MIN_LEN: usize = 8;
 pub const PSK_MAX_LEN: usize = 63;
 
 /// EAP credential minimum length
+#[allow(dead_code)] // public domain constant; not yet exercised by this crate
 pub const EAP_MIN_LEN: usize = 0;
 
 /// EAP credential maximum length
+#[allow(dead_code)] // public domain constant; not yet exercised by this crate
 pub const EAP_MAX_LEN: usize = 256;
 
 /// IEEE 802.11 SSID maximum length
+#[allow(dead_code)] // public domain constant; used for SSID validation
 pub const IEEE80211_NWID_LEN: usize = 32;
 
 use kameo::actor::ActorRef;

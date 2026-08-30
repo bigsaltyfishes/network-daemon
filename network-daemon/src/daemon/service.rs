@@ -1,7 +1,6 @@
 use std::{collections::HashMap, fs::File, io::Write, path::PathBuf};
 
 use async_net::unix::{UnixListener, UnixStream};
-use futures_lite::{AsyncReadExt, AsyncWriteExt};
 use kameo::{
     Actor,
     actor::{ActorRef, Spawn},
@@ -90,6 +89,7 @@ where
             .read(true)
             .write(true)
             .create(true)
+            .truncate(true)
             .open(&pid_file_path)
             .map_err(|e| {
                 error!("Failed to open pid file: {}", e);
@@ -178,39 +178,30 @@ where
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         debug!("Received WiFi Manager Event: {:?}", msg);
-        match msg {
-            WiFiManagerEvent::StatusUpdated { iface, status } => {
-                let state = match status.state {
-                    Some(WpaState::InterfaceDisabled) => {
-                        Some(ConnectionState::Disabled)
-                    }
-                    Some(WpaState::Unknown) => {
-                        Some(ConnectionState::NotApplicable)
-                    }
-                    Some(WpaState::Completed) => {
-                        Some(ConnectionState::Connected)
-                    }
-                    Some(WpaState::Disconnected)
-                    | Some(WpaState::Inactive)
-                    | Some(WpaState::Scanning) => {
-                        Some(ConnectionState::NoCarrier)
-                    }
-                    Some(_) => Some(ConnectionState::Up),
-                    _ => None,
-                };
-
-                if let Some(state) = state {
-                    ignore!(
-                        self.ifmgr
-                            .tell(InterfaceManagerAction::UpdateExternalInterfaceState {
-                                name: iface,
-                                state
-                            })
-                            .await
-                    );
+        if let WiFiManagerEvent::StatusUpdated { iface, status } = msg {
+            let state = match status.state {
+                Some(WpaState::InterfaceDisabled) => {
+                    Some(ConnectionState::Disabled)
                 }
+                Some(WpaState::Unknown) => Some(ConnectionState::NotApplicable),
+                Some(WpaState::Completed) => Some(ConnectionState::Connected),
+                Some(WpaState::Disconnected)
+                | Some(WpaState::Inactive)
+                | Some(WpaState::Scanning) => Some(ConnectionState::NoCarrier),
+                Some(_) => Some(ConnectionState::Up),
+                _ => None,
+            };
+
+            if let Some(state) = state {
+                ignore!(
+                    self.ifmgr
+                        .tell(InterfaceManagerAction::UpdateExternalInterfaceState {
+                            name: iface,
+                            state
+                        })
+                        .await
+                );
             }
-            _ => {}
         }
     }
 }
@@ -226,11 +217,8 @@ where
         msg: StreamMessage<WiFiManagerEvent, (), ()>,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        match msg {
-            StreamMessage::Next(event) => {
-                ignore!(self.handle(event, ctx).await);
-            }
-            _ => {}
+        if let StreamMessage::Next(event) = msg {
+            ignore!(self.handle(event, ctx).await);
         }
     }
 }
@@ -275,163 +263,157 @@ where
         msg: StreamMessage<InterfaceManagerEvent, (), ()>,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        match msg {
-            StreamMessage::Next(event) => {
-                debug!("Received Interface Manager Event: {:?}", event);
-                // Handle interface manager events here
-                match event {
-                    InterfaceManagerEvent::InterfaceAdded(info) => {
-                        info!("Interface added: {:?}", info);
-                        if info.is_wlan() {
-                            let iface_name = info.name.clone();
-                            // Create WifiManager Supervisor for the interface
-                            let wifi_mgr = WifiManager::<W>::new(
-                                self.working_dir.clone(),
-                                iface_name.clone(),
+        if let StreamMessage::Next(event) = msg {
+            debug!("Received Interface Manager Event: {:?}", event);
+            // Handle interface manager events here
+            match event {
+                InterfaceManagerEvent::InterfaceAdded(info) => {
+                    info!("Interface added: {:?}", info);
+                    if info.is_wlan() {
+                        let iface_name = info.name.clone();
+                        // Create WifiManager Supervisor for the interface
+                        let wifi_mgr = WifiManager::<W>::new(
+                            self.working_dir.clone(),
+                            iface_name.clone(),
+                        );
+
+                        // Subscribe to events
+                        let event_receiver = wifi_mgr.subscribe();
+                        ctx.actor_ref().attach_stream(
+                            Box::pin(event_receiver),
+                            (),
+                            (),
+                        );
+
+                        // Start WifiManager supervisor (Args=Self)
+                        let supervisor_ref =
+                            WifiManager::<W>::spawn_with_mailbox(
+                                wifi_mgr,
+                                mailbox::unbounded(),
                             );
+                        self.wifi_supervisors
+                            .insert(iface_name.clone(), supervisor_ref);
 
-                            // Subscribe to events
-                            let event_receiver = wifi_mgr.subscribe();
-                            ctx.actor_ref().attach_stream(
-                                Box::pin(event_receiver),
-                                (),
-                                (),
-                            );
-
-                            // Start WifiManager supervisor (Args=Self)
-                            let supervisor_ref =
-                                WifiManager::<W>::spawn_with_mailbox(
-                                    wifi_mgr,
-                                    mailbox::unbounded(),
-                                );
-                            self.wifi_supervisors
-                                .insert(iface_name.clone(), supervisor_ref);
-
-                            info!(
-                                "Started WiFi Manager for interface: {}",
-                                info.name
-                            );
-                        }
-
-                        if info.dhcpv4_enabled
-                            && info.state == ConnectionState::Up
-                            && self.dhcp_supervisors.get(&info.name).is_none()
-                            && let Some(mac) = info.mac_addr.clone()
-                        {
-                            let iface_name = info.name.clone();
-                            // Create DhcpManager Supervisor for the interface
-                            let dhcp_mgr = DhcpManager::new(
-                                iface_name.clone(),
-                                mac,
-                                self.ifmgr.clone(),
-                            );
-
-                            // Start DhcpManager supervisor (Args=Self)
-                            let supervisor_ref =
-                                DhcpManager::spawn_with_mailbox(
-                                    dhcp_mgr,
-                                    mailbox::unbounded(),
-                                );
-                            self.dhcp_supervisors
-                                .insert(iface_name.clone(), supervisor_ref);
-
-                            info!(
-                                "Started DHCP Manager for interface: {}",
-                                info.name
-                            );
-                        }
+                        info!(
+                            "Started WiFi Manager for interface: {}",
+                            info.name
+                        );
                     }
-                    InterfaceManagerEvent::InterfaceRemoved(info) => {
-                        info!("Interface removed: {:?}", info);
-                        if info.is_wlan() {
-                            let iface_name = info.name.clone();
-                            if let Some(w) =
-                                self.wifi_supervisors.remove(&iface_name)
-                            {
-                                if let Err(e) = w.stop_gracefully().await {
-                                    error!(
-                                        "Failed to stop WiFi Manager for \
-                                         interface {}: {}, Killing actor",
-                                        iface_name, e
-                                    );
-                                    w.kill();
-                                }
-                            }
-                        }
+
+                    if info.dhcpv4_enabled
+                        && info.state == ConnectionState::Up
+                        && !self.dhcp_supervisors.contains_key(&info.name)
+                        && let Some(mac) = info.mac_addr
+                    {
+                        let iface_name = info.name.clone();
+                        // Create DhcpManager Supervisor for the interface
+                        let dhcp_mgr = DhcpManager::new(
+                            iface_name.clone(),
+                            mac,
+                            self.ifmgr.clone(),
+                        );
+
+                        // Start DhcpManager supervisor (Args=Self)
+                        let supervisor_ref = DhcpManager::spawn_with_mailbox(
+                            dhcp_mgr,
+                            mailbox::unbounded(),
+                        );
+                        self.dhcp_supervisors
+                            .insert(iface_name.clone(), supervisor_ref);
+
+                        info!(
+                            "Started DHCP Manager for interface: {}",
+                            info.name
+                        );
                     }
-                    InterfaceManagerEvent::InterfaceChanged(info) => {
-                        info!("Interface changed: {:?}", info);
-                        if !info.dhcpv4_enabled {
-                            if let Some(d) =
-                                self.dhcp_supervisors.remove(&info.name)
-                            {
-                                if let Err(e) = d.stop_gracefully().await {
-                                    error!(
-                                        "Failed to stop DHCP Manager for \
-                                         interface {}: {}, Killing actor",
-                                        info.name, e
-                                    );
-                                    d.kill();
-                                } else {
-                                    info!(
-                                        "Stopped DHCP Manager for interface: \
-                                         {}",
-                                        info.name
-                                    );
-                                }
-                            }
-                        } else if !matches!(
-                            info.state,
-                            ConnectionState::Up | ConnectionState::Connected
-                        ) {
-                            if let Some(d) =
-                                self.dhcp_supervisors.remove(&info.name)
-                            {
-                                if let Err(e) = d.stop_gracefully().await {
-                                    error!(
-                                        "Failed to stop DHCP Manager for \
-                                         interface {}: {}, Killing actor",
-                                        info.name, e
-                                    );
-                                    d.kill();
-                                } else {
-                                    info!(
-                                        "Stopped DHCP Manager for interface: \
-                                         {}",
-                                        info.name
-                                    );
-                                }
-                            }
-                        } else if info.state == ConnectionState::Up
-                            && self.dhcp_supervisors.get(&info.name).is_none()
-                            && let Some(mac) = info.mac_addr.clone()
+                }
+                InterfaceManagerEvent::InterfaceRemoved(info) => {
+                    info!("Interface removed: {:?}", info);
+                    if info.is_wlan() {
+                        let iface_name = info.name.clone();
+                        if let Some(w) =
+                            self.wifi_supervisors.remove(&iface_name)
+                            && let Err(e) = w.stop_gracefully().await
                         {
-                            let iface_name = info.name.clone();
-                            // Create DhcpManager Supervisor for the interface
-                            let dhcp_mgr = DhcpManager::new(
-                                iface_name.clone(),
-                                mac,
-                                self.ifmgr.clone(),
+                            error!(
+                                "Failed to stop WiFi Manager for \
+                                 interface {}: {}, Killing actor",
+                                iface_name, e
                             );
-
-                            // Start DhcpManager supervisor (Args=Self)
-                            let supervisor_ref =
-                                DhcpManager::spawn_with_mailbox(
-                                    dhcp_mgr,
-                                    mailbox::unbounded(),
-                                );
-                            self.dhcp_supervisors
-                                .insert(iface_name.clone(), supervisor_ref);
-
-                            info!(
-                                "Started DHCP Manager for interface: {}",
-                                info.name
-                            );
+                            w.kill();
                         }
                     }
                 }
+                InterfaceManagerEvent::InterfaceChanged(info) => {
+                    info!("Interface changed: {:?}", info);
+                    if !info.dhcpv4_enabled {
+                        if let Some(d) =
+                            self.dhcp_supervisors.remove(&info.name)
+                        {
+                            if let Err(e) = d.stop_gracefully().await {
+                                error!(
+                                    "Failed to stop DHCP Manager for \
+                                     interface {}: {}, Killing actor",
+                                    info.name, e
+                                );
+                                d.kill();
+                            } else {
+                                info!(
+                                    "Stopped DHCP Manager for interface: \
+                                     {}",
+                                    info.name
+                                );
+                            }
+                        }
+                    } else if !matches!(
+                        info.state,
+                        ConnectionState::Up | ConnectionState::Connected
+                    ) {
+                        if let Some(d) =
+                            self.dhcp_supervisors.remove(&info.name)
+                        {
+                            if let Err(e) = d.stop_gracefully().await {
+                                error!(
+                                    "Failed to stop DHCP Manager for \
+                                     interface {}: {}, Killing actor",
+                                    info.name, e
+                                );
+                                d.kill();
+                            } else {
+                                info!(
+                                    "Stopped DHCP Manager for interface: \
+                                     {}",
+                                    info.name
+                                );
+                            }
+                        }
+                    } else if info.state == ConnectionState::Up
+                        && !self.dhcp_supervisors.contains_key(&info.name)
+                        && let Some(mac) = info.mac_addr
+                    {
+                        let iface_name = info.name.clone();
+                        // Create DhcpManager Supervisor for the interface
+                        let dhcp_mgr = DhcpManager::new(
+                            iface_name.clone(),
+                            mac,
+                            self.ifmgr.clone(),
+                        );
+
+                        // Start DhcpManager supervisor (Args=Self)
+                        let supervisor_ref = DhcpManager::spawn_with_mailbox(
+                            dhcp_mgr,
+                            mailbox::unbounded(),
+                        );
+                        self.dhcp_supervisors
+                            .insert(iface_name.clone(), supervisor_ref);
+
+                        info!(
+                            "Started DHCP Manager for interface: {}",
+                            info.name
+                        );
+                    }
+                }
             }
-            _ => {}
         }
     }
 }

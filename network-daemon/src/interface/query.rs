@@ -22,10 +22,9 @@ impl NetlinkQuery<InterfaceInfo> {
         let prefix = msg.header.prefix_len;
         msg.attributes
             .into_iter()
-            .filter(|v| matches!(v, AddressAttribute::Address(_)))
-            .map(|v| match v {
-                AddressAttribute::Address(ip) => ip,
-                _ => unreachable!(),
+            .filter_map(|v| match v {
+                AddressAttribute::Address(ip) => Some(ip),
+                _ => None,
             })
             .for_each(|v| interface.add_addr(v.into_prefixed(prefix)));
 
@@ -74,12 +73,11 @@ impl NetlinkQuery<InterfaceInfo> {
             NLM_F_REQUEST | NLM_F_DUMP,
             RouteNetlinkMessage::GetAddress(addr_msg),
             |msg| {
-                if let RouteNetlinkMessage::NewAddress(addr) = msg {
-                    if let Some(interface) =
+                if let RouteNetlinkMessage::NewAddress(addr) = msg
+                    && let Some(interface) =
                         interfaces.get_mut(&addr.header.index)
-                    {
-                        Self::extract_addresses(addr, interface);
-                    }
+                {
+                    Self::extract_addresses(addr, interface);
                 }
             },
         )
@@ -141,19 +139,19 @@ impl NetlinkQuery<InterfaceInfo> {
     }
 
     fn build_info(msg: LinkMessage) -> InterfaceInfo {
-        let mut info = InterfaceInfo::default();
-        info.id = msg.header.index;
-
-        info.state = if msg.header.flags.contains(LinkFlags::Up) {
-            ConnectionState::Up
-        } else {
-            ConnectionState::Disabled
-        };
-
-        info.interface_type = match msg.header.link_layer_type {
-            LinkLayerType::Ether => InterfaceType::Ethernet,
-            LinkLayerType::Ieee80211 => InterfaceType::Wlan,
-            _ => InterfaceType::Other,
+        let mut info = InterfaceInfo {
+            id: msg.header.index,
+            state: if msg.header.flags.contains(LinkFlags::Up) {
+                ConnectionState::Up
+            } else {
+                ConnectionState::Disabled
+            },
+            interface_type: match msg.header.link_layer_type {
+                LinkLayerType::Ether => InterfaceType::Ethernet,
+                LinkLayerType::Ieee80211 => InterfaceType::Wlan,
+                _ => InterfaceType::Other,
+            },
+            ..Default::default()
         };
 
         for attr in msg.attributes {

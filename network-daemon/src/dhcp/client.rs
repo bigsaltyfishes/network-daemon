@@ -119,7 +119,7 @@ impl DhcpClient {
         src: Option<[u8; 4]>,
         dest: Option<[u8; 4]>,
     ) -> Result<Vec<u8>, DhcpClientError> {
-        let mac = self.mac.clone();
+        let mac = self.mac;
         let builder = PacketBuilder::ethernet2(*mac.as_bytes(), BROADCAST_MAC)
             .ipv4(
                 src.unwrap_or([0, 0, 0, 0]),
@@ -199,16 +199,15 @@ impl DhcpClient {
                     let offer = s.socket.next().await;
                     match offer {
                         Some(Ok(dhcp_msg)) => {
-                            if dhcp_msg.xid() == s.xid {
-                                if let Some(v4::MessageType::Offer) =
+                            if dhcp_msg.xid() == s.xid
+                                && let Some(v4::MessageType::Offer) =
                                     dhcp_msg.opts().msg_type()
-                                {
-                                    info!(
-                                        "DHCP Client [{}]: Received OFFER",
-                                        s.iface
-                                    );
-                                    return ControlFlow::Break(Ok(dhcp_msg));
-                                }
+                            {
+                                info!(
+                                    "DHCP Client [{}]: Received OFFER",
+                                    s.iface
+                                );
+                                return ControlFlow::Break(Ok(dhcp_msg));
                             }
                             // Ignore other packets
                         }
@@ -620,6 +619,7 @@ impl DhcpClient {
         Ok(())
     }
 
+    #[allow(dead_code)] // DHCP DECLINE; used to report a bad lease
     pub async fn decline(
         &mut self,
         lease: Lease,
@@ -746,7 +746,7 @@ impl Message<LeaseEvent> for DhcpClient {
             let old_lease = self.lease.clone();
             self.lease = None;
             ignore!(self.manager.tell((old_lease, None)).await);
-            return Err(DhcpClientError::ServerRejected);
+            Err(DhcpClientError::ServerRejected)
         } else {
             let new_lease = new_lease?;
             let old_lease = self.lease.clone();

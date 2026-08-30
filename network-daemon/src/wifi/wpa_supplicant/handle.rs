@@ -41,7 +41,7 @@ impl WpaSupplicantInstanceHandle {
         // Wait for socket to be created
         let socket_path = workdir.as_ref().join(iface);
         let start = std::time::Instant::now();
-        while !tokio::fs::metadata(&socket_path).await.is_ok() {
+        while tokio::fs::metadata(&socket_path).await.is_err() {
             if start.elapsed() > Duration::from_millis(5000) {
                 return Err(WifiError::SupplicantStartFailed(
                     "Operation timeout".to_string(),

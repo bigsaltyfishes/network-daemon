@@ -1,14 +1,9 @@
 mod backup;
 mod table;
 
-use std::{
-    collections::HashMap,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    path::Prefix,
-};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use async_channel::Receiver;
-use dhcproto::v6;
 use futures_lite::stream;
 use kameo::{
     Actor,
@@ -18,7 +13,7 @@ use kameo::{
 };
 use libnetwork_daemon::{
     ConnectionState, InterfaceInfo, InterfaceManagerEvent, IntoPrefixed,
-    PrefixedIpv4Addr, PrefixedIpv6Addr, ensure, ignore,
+    PrefixedIpv4Addr, PrefixedIpv6Addr, ignore,
 };
 use route_manager::{
     AsyncRouteListener, AsyncRouteManager as RawRouteManager, Route,
@@ -103,58 +98,58 @@ impl RouteManager {
                 match rt.destination() {
                     IpAddr::V4(ip) => {
                         let ip = ip.into_prefixed(rt.prefix());
-                        if let Some(outputs) = self.v4_backup.net_outputs(&ip) {
-                            if let Some(&output) =
-                                outputs.filter(|&&oif| oif != info.id).next()
-                            {
-                                // Kernel may have automatically
-                                // added the route back,
-                                // so ignore errors here.
-                                // TODO: Check kernel behavior
-                                info!(
-                                    "Adding back route via {} on interface {}",
-                                    ip, output
-                                );
-                                ignore!(
-                                    self.route_mgr
-                                        .add(
-                                            &Route::new(
-                                                rt.destination(),
-                                                rt.prefix()
-                                            )
-                                            .with_if_index(output)
+                        if let Some(mut outputs) =
+                            self.v4_backup.net_outputs(&ip)
+                            && let Some(&output) =
+                                outputs.find(|&&oif| oif != info.id)
+                        {
+                            // Kernel may have automatically
+                            // added the route back,
+                            // so ignore errors here.
+                            // TODO: Check kernel behavior
+                            info!(
+                                "Adding back route via {} on interface {}",
+                                ip, output
+                            );
+                            ignore!(
+                                self.route_mgr
+                                    .add(
+                                        &Route::new(
+                                            rt.destination(),
+                                            rt.prefix()
                                         )
-                                        .await
-                                );
-                            }
+                                        .with_if_index(output)
+                                    )
+                                    .await
+                            );
                         }
                     }
                     IpAddr::V6(ip) => {
                         let ip = ip.into_prefixed(rt.prefix());
-                        if let Some(outputs) = self.v6_backup.net_outputs(&ip) {
-                            if let Some(&output) =
-                                outputs.filter(|&&oif| oif != info.id).next()
-                            {
-                                // Kernel may have automatically
-                                // added the route back,
-                                // so ignore errors here.
-                                // TODO: Check kernel behavior
-                                info!(
-                                    "Adding back route via {} on interface {}",
-                                    ip, output
-                                );
-                                ignore!(
-                                    self.route_mgr
-                                        .add(
-                                            &Route::new(
-                                                rt.destination(),
-                                                rt.prefix()
-                                            )
-                                            .with_if_index(output)
+                        if let Some(mut outputs) =
+                            self.v6_backup.net_outputs(&ip)
+                            && let Some(&output) =
+                                outputs.find(|&&oif| oif != info.id)
+                        {
+                            // Kernel may have automatically
+                            // added the route back,
+                            // so ignore errors here.
+                            // TODO: Check kernel behavior
+                            info!(
+                                "Adding back route via {} on interface {}",
+                                ip, output
+                            );
+                            ignore!(
+                                self.route_mgr
+                                    .add(
+                                        &Route::new(
+                                            rt.destination(),
+                                            rt.prefix()
                                         )
-                                        .await
-                                );
-                            }
+                                        .with_if_index(output)
+                                    )
+                                    .await
+                            );
                         }
                     }
                 }
@@ -165,7 +160,6 @@ impl RouteManager {
         }
     }
 }
-
 impl Actor for RouteManager {
     type Args = Receiver<InterfaceManagerEvent>;
     type Error = RouteManagerError;
@@ -220,77 +214,74 @@ impl Message<StreamMessage<InterfaceManagerEvent, (), ()>> for RouteManager {
         msg: StreamMessage<InterfaceManagerEvent, (), ()>,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        match msg {
-            StreamMessage::Next(evt) => {
-                match evt {
-                    InterfaceManagerEvent::InterfaceAdded(info) => {
-                        if let (Some(gw), nets) =
-                            (&info.gateway_ipv4, &info.ipv4_addrs)
-                        {
-                            self.v4_backup.insert(
-                                info.id,
-                                gw.clone(),
-                                nets.iter().map(|ip| ip.net_id()),
-                            );
-                        }
-                        if let Some(gw) = &info.gateway_ipv6 {
-                            self.v6_backup.insert(
-                                info.id,
-                                gw.clone(),
-                                info.ipv6_addrs.iter().map(|ip| ip.net_id()),
-                            );
-                        }
-
-                        // After interface added, check and add default routes
-                        // if needed, usually required
-                        // when daemon just started.
-                        self.add_default_rt_if_needed().await;
+        if let StreamMessage::Next(evt) = msg {
+            match evt {
+                InterfaceManagerEvent::InterfaceAdded(info) => {
+                    if let (Some(gw), nets) =
+                        (&info.gateway_ipv4, &info.ipv4_addrs)
+                    {
+                        self.v4_backup.insert(
+                            info.id,
+                            gw.clone(),
+                            nets.iter().map(|ip| ip.net_id()),
+                        );
                     }
-                    InterfaceManagerEvent::InterfaceRemoved(info) => {
+                    if let Some(gw) = &info.gateway_ipv6 {
+                        self.v6_backup.insert(
+                            info.id,
+                            gw.clone(),
+                            info.ipv6_addrs.iter().map(|ip| ip.net_id()),
+                        );
+                    }
+
+                    // After interface added, check and add default routes
+                    // if needed, usually required
+                    // when daemon just started.
+                    self.add_default_rt_if_needed().await;
+                }
+                InterfaceManagerEvent::InterfaceRemoved(info) => {
+                    self.v4_backup.remove(info.id);
+                    self.v6_backup.remove(info.id);
+
+                    // Clean up dead routes
+                    self.dead_rt_cleanup(&info).await;
+                }
+                InterfaceManagerEvent::InterfaceChanged(info) => {
+                    // Update IPv4 gateway
+                    if let Some(gw) = &info.gateway_ipv4 {
+                        self.v4_backup.insert(
+                            info.id,
+                            gw.clone(),
+                            info.ipv4_addrs.iter().map(|ip| ip.net_id()),
+                        );
+                    } else {
+                        self.v4_backup.remove(info.id);
+                    }
+
+                    // Update IPv6 gateway
+                    if let Some(gw) = &info.gateway_ipv6 {
+                        self.v6_backup.insert(
+                            info.id,
+                            gw.clone(),
+                            info.ipv6_addrs.iter().map(|ip| ip.net_id()),
+                        );
+                    } else {
+                        self.v6_backup.remove(info.id);
+                    }
+
+                    // Clean up dead routes
+                    if info.state != ConnectionState::Connected {
                         self.v4_backup.remove(info.id);
                         self.v6_backup.remove(info.id);
 
-                        // Clean up dead routes
                         self.dead_rt_cleanup(&info).await;
                     }
-                    InterfaceManagerEvent::InterfaceChanged(info) => {
-                        // Update IPv4 gateway
-                        if let Some(gw) = &info.gateway_ipv4 {
-                            self.v4_backup.insert(
-                                info.id,
-                                gw.clone(),
-                                info.ipv4_addrs.iter().map(|ip| ip.net_id()),
-                            );
-                        } else {
-                            self.v4_backup.remove(info.id);
-                        }
 
-                        // Update IPv6 gateway
-                        if let Some(gw) = &info.gateway_ipv6 {
-                            self.v6_backup.insert(
-                                info.id,
-                                gw.clone(),
-                                info.ipv6_addrs.iter().map(|ip| ip.net_id()),
-                            );
-                        } else {
-                            self.v6_backup.remove(info.id);
-                        }
-
-                        // Clean up dead routes
-                        if info.state != ConnectionState::Connected {
-                            self.v4_backup.remove(info.id);
-                            self.v6_backup.remove(info.id);
-
-                            self.dead_rt_cleanup(&info).await;
-                        }
-
-                        // Default route addition will be handled in
-                        // `RouteChange` handler
-                        self.add_default_rt_if_needed().await;
-                    }
+                    // Default route addition will be handled in
+                    // `RouteChange` handler
+                    self.add_default_rt_if_needed().await;
                 }
             }
-            _ => {}
         }
     }
 }

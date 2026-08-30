@@ -140,7 +140,7 @@ impl Ifconfig {
             }
 
             let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
-            let c_name = CString::from_str(&*name)?;
+            let c_name = CString::from_str(&name)?;
             let name_bytes = c_name.as_bytes_with_nul();
 
             unsafe {
@@ -179,6 +179,10 @@ impl Ifconfig {
         .await?
     }
 
+    /// Query whether SLAAC (kernel RA) is enabled on an interface.
+    ///
+    /// Used by the SLAAC-wiring phase of the daemon (Phase E); wired up later.
+    #[allow(dead_code)]
     pub async fn get_slaac_state(
         &self,
         name: &str,
@@ -194,7 +198,7 @@ impl Ifconfig {
             }
 
             let mut ifreq: ffi::in6_ndireq = unsafe { std::mem::zeroed() };
-            let c_name = CString::from_str(&*name)?;
+            let c_name = CString::from_str(&name)?;
             let name_bytes = c_name.as_bytes_with_nul();
 
             unsafe {
@@ -213,7 +217,7 @@ impl Ifconfig {
                 }
 
                 let enabled =
-                    (ifreq.ndi.flags & ffi::ND6_IFF_ACCEPT_RTADV as u32) != 0;
+                    (ifreq.ndi.flags & ffi::ND6_IFF_ACCEPT_RTADV) != 0;
                 libc::close(s);
                 Ok(enabled)
             }
@@ -223,6 +227,10 @@ impl Ifconfig {
         Ok(ret)
     }
 
+    /// Enable/disable SLAAC (kernel RA) on an interface.
+    ///
+    /// Used by the SLAAC-wiring phase of the daemon (Phase E); wired up later.
+    #[allow(dead_code)]
     pub async fn set_slaac_state(
         &self,
         name: &str,
@@ -239,7 +247,7 @@ impl Ifconfig {
             }
 
             let mut ifreq: ffi::in6_ndireq = unsafe { std::mem::zeroed() };
-            let c_name = CString::from_str(&*name)?;
+            let c_name = CString::from_str(&name)?;
             let name_bytes = c_name.as_bytes_with_nul();
 
             unsafe {
@@ -258,9 +266,9 @@ impl Ifconfig {
                 }
 
                 if enabled {
-                    ifreq.ndi.flags |= ffi::ND6_IFF_ACCEPT_RTADV as u32;
+                    ifreq.ndi.flags |= ffi::ND6_IFF_ACCEPT_RTADV;
                 } else {
-                    ifreq.ndi.flags &= !(ffi::ND6_IFF_ACCEPT_RTADV as u32);
+                    ifreq.ndi.flags &= !(ffi::ND6_IFF_ACCEPT_RTADV);
                 }
 
                 if libc::ioctl(s, ffi::SIOCSIFINFO_IN6 as _, &mut ifreq) < 0 {

@@ -214,7 +214,9 @@ impl std::fmt::Display for WpaCommand {
             WpaCommand::Scan => write!(f, "SCAN"),
             WpaCommand::ScanResults => write!(f, "SCAN_RESULTS"),
             WpaCommand::Status => write!(f, "STATUS"),
-            WpaCommand::Set { key, value } => write!(f, "SET {} {}", key, value),
+            WpaCommand::Set { key, value } => {
+                write!(f, "SET {} {}", key, value)
+            }
             WpaCommand::AddNetwork => write!(f, "ADD_NETWORK"),
             WpaCommand::SetNetwork { id, key, value } => {
                 write!(f, "SET_NETWORK {} {} {}", id, key, value)
@@ -223,9 +225,15 @@ impl std::fmt::Display for WpaCommand {
                 write!(f, "GET_NETWORK {} {}", id, key)
             }
             WpaCommand::ListNetworks => write!(f, "LIST_NETWORKS"),
-            WpaCommand::EnableNetwork { id } => write!(f, "ENABLE_NETWORK {}", id),
-            WpaCommand::DisableNetwork { id } => write!(f, "DISABLE_NETWORK {}", id),
-            WpaCommand::RemoveNetwork { id } => write!(f, "REMOVE_NETWORK {}", id),
+            WpaCommand::EnableNetwork { id } => {
+                write!(f, "ENABLE_NETWORK {}", id)
+            }
+            WpaCommand::DisableNetwork { id } => {
+                write!(f, "DISABLE_NETWORK {}", id)
+            }
+            WpaCommand::RemoveNetwork { id } => {
+                write!(f, "REMOVE_NETWORK {}", id)
+            }
             WpaCommand::SelectNetwork { id } => match id {
                 Some(id) => write!(f, "SELECT_NETWORK {}", id),
                 None => write!(f, "SELECT_NETWORK any"),

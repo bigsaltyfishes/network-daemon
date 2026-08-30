@@ -19,19 +19,16 @@ pub struct DhcpSocket {
 impl DhcpSocket {
     pub fn new(iface: &str) -> io::Result<Self> {
         let mut cap = Capture::from_device(iface)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+            .map_err(io::Error::other)?
             .immediate_mode(true)
             .promisc(true)
             .buffer_size(4096)
             .open()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
 
-        cap.filter(BPF_FILTER, true)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        cap.filter(BPF_FILTER, true).map_err(io::Error::other)?;
 
-        cap = cap
-            .setnonblock()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        cap = cap.setnonblock().map_err(io::Error::other)?;
 
         Ok(DhcpSocket {
             inner: Async::new(cap)?,
@@ -69,10 +66,7 @@ impl AsyncWrite for DhcpSocket {
 
                 match cap.sendpacket(buf) {
                     Ok(_) => Poll::Ready(Ok(buf.len())),
-                    Err(e) => Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        e,
-                    ))),
+                    Err(e) => Poll::Ready(Err(io::Error::other(e))),
                 }
             }
             Poll::Pending => Poll::Pending,
@@ -125,10 +119,7 @@ impl Stream for DhcpSocket {
                             return Poll::Ready(None);
                         }
                         Err(e) => {
-                            return Poll::Ready(Some(Err(io::Error::new(
-                                io::ErrorKind::Other,
-                                e,
-                            ))));
+                            return Poll::Ready(Some(Err(io::Error::other(e))));
                         }
                     }
                 }

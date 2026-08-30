@@ -25,7 +25,9 @@ impl PrefixedIpv4Addr {
     pub fn net_id(&self) -> Self {
         // A prefix of 0 (default route) must clear all bits; a plain shift by
         // `32 - 0 = 32` would overflow, so use a checked shift (None -> 0).
-        let mask = (!0u32).checked_shl(32 - self.prefix_len as u32).unwrap_or(0);
+        let mask = (!0u32)
+            .checked_shl(32 - self.prefix_len as u32)
+            .unwrap_or(0);
         let net_id = self.addr.to_bits() & mask;
         Self {
             addr: std::net::Ipv4Addr::from(net_id),
@@ -121,7 +123,9 @@ impl PrefixedIpv6Addr {
     pub fn net_id(&self) -> Self {
         // A prefix of 0 (default route) must clear all bits; a plain shift by
         // `128 - 0 = 128` would overflow, so use a checked shift (None -> 0).
-        let mask = (!0u128).checked_shl(128 - self.prefix_len as u32).unwrap_or(0);
+        let mask = (!0u128)
+            .checked_shl(128 - self.prefix_len as u32)
+            .unwrap_or(0);
         let net_id = self.addr.to_bits() & mask;
 
         Self {
@@ -271,8 +275,10 @@ mod tests {
 
     #[test]
     fn v6_net_id_masks_host_bits() {
-        let p =
-            PrefixedIpv6Addr::new(Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, 1), 64);
+        let p = PrefixedIpv6Addr::new(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, 1),
+            64,
+        );
         assert_eq!(
             p.net_id(),
             PrefixedIpv6Addr::new(
@@ -284,7 +290,10 @@ mod tests {
 
     #[test]
     fn v6_net_id_default_route_prefix() {
-        let p = PrefixedIpv6Addr::new(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 0);
+        let p = PrefixedIpv6Addr::new(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            0,
+        );
         assert_eq!(p.net_id(), PrefixedIpv6Addr::UNSPECIFIED);
     }
 

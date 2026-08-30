@@ -2,6 +2,7 @@ use std::{ops::ControlFlow, time::Duration};
 
 #[derive(Debug)]
 pub enum AttemptError<E> {
+    #[allow(dead_code)] // possible outcome, not currently produced
     Timeout,
     RetriesExhausted,
     CrticalError(E),

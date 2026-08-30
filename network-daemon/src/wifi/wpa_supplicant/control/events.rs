@@ -1,8 +1,4 @@
-use std::{
-    io::{Read, Write},
-    path::Path,
-    task::Poll,
-};
+use std::{path::Path, task::Poll};
 
 use async_io::Async;
 use futures_lite::{AsyncReadExt, AsyncWriteExt, Stream};
@@ -56,6 +52,7 @@ impl WpaEventListener {
         Ok(())
     }
 
+    #[allow(dead_code)] // control detach
     pub async fn detach(&mut self) -> Result<(), WpaCtrlError> {
         // Send DETACH command
         self.0.write_all(b"DETACH").await.map_err(|e| {
@@ -68,6 +65,7 @@ impl WpaEventListener {
         Ok(())
     }
 
+    #[allow(dead_code)] // synchronous event poll (async event stream used instead)
     pub async fn wait_event(&mut self) -> Result<WpaEvent, WpaCtrlError> {
         let mut buf = vec![0u8; WPA_MAX_REPLY_SIZE];
 
