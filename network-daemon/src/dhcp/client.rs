@@ -767,3 +767,48 @@ impl Message<LeaseEvent> for DhcpClient {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn builder_sets_packet_fields() {
+        let mac = MacAddr::new([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+        let msg = DhcpPacketBuilder::default()
+            .set_xid(0x01020304)
+            .set_htype(v4::HType::Eth)
+            .set_opcode(v4::Opcode::BootRequest)
+            .set_broadcast(true)
+            .set_chaddr(&mac)
+            .set_ciaddr(Ipv4Addr::new(192, 168, 1, 10))
+            .build();
+
+        assert_eq!(msg.xid(), 0x01020304);
+        assert_eq!(msg.htype(), v4::HType::Eth);
+        assert_eq!(msg.opcode(), v4::Opcode::BootRequest);
+        assert_eq!(msg.ciaddr(), Ipv4Addr::new(192, 168, 1, 10));
+        // Broadcast flag bit 0x8000 is set (verified in broadcast_flag_toggles).
+    }
+
+    #[test]
+    fn broadcast_flag_toggles() {
+        let on = DhcpPacketBuilder::default().set_broadcast(true).build();
+        assert!(on.flags().broadcast());
+
+        let off = DhcpPacketBuilder::default().set_broadcast(false).build();
+        assert!(!off.flags().broadcast());
+    }
+
+    #[test]
+    fn builder_inserts_options() {
+        let msg = DhcpPacketBuilder::default()
+            .insert_option(v4::DhcpOption::MessageType(
+                v4::MessageType::Discover,
+            ))
+            .insert_option(v4::DhcpOption::AddressLeaseTime(3600))
+            .build();
+        assert_eq!(msg.opts().msg_type(), Some(v4::MessageType::Discover));
+    }
+}
