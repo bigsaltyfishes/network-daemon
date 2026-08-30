@@ -97,3 +97,43 @@ impl JsonSchema for MacAddr {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_valid_lowercase() {
+        let mac = MacAddr::parse("aa:bb:cc:dd:ee:ff").unwrap();
+        assert_eq!(mac.to_string(), "aa:bb:cc:dd:ee:ff");
+    }
+
+    #[test]
+    fn parse_is_case_insensitive_and_trimmed() {
+        let mac = MacAddr::parse("  AA:BB:CC:DD:EE:FF ").unwrap();
+        assert_eq!(mac.to_string(), "aa:bb:cc:dd:ee:ff");
+    }
+
+    #[test]
+    fn parse_rejects_bad_length_and_format() {
+        assert!(MacAddr::parse("aa:bb:cc:dd:ee").is_none());
+        assert!(MacAddr::parse("aa:bb:cc:dd:ee:ff:00").is_none());
+        assert!(MacAddr::parse("zz:bb:cc:dd:ee:ff").is_none());
+        assert!(MacAddr::parse("").is_none());
+    }
+
+    #[test]
+    fn serde_round_trip() {
+        let mac = MacAddr::parse("10:20:30:40:50:60").unwrap();
+        let ser = serde_json::to_string(&mac).unwrap();
+        assert_eq!(ser, "\"10:20:30:40:50:60\"");
+        let de: MacAddr = serde_json::from_str(&ser).unwrap();
+        assert_eq!(de, mac);
+    }
+
+    #[test]
+    fn bytes_round_trip() {
+        let mac = MacAddr::new([1, 2, 3, 4, 5, 6]);
+        assert_eq!(mac.as_bytes(), &[1, 2, 3, 4, 5, 6]);
+    }
+}

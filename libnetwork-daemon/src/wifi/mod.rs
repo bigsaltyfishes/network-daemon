@@ -13,7 +13,7 @@ pub use security::Security;
 use serde::{Deserialize, Serialize};
 pub use status::{SupplicantStatus, WpaState};
 
-use crate::{MacAddr, error::WifiError};
+use crate::MacAddr;
 
 #[derive(Debug, Serialize, JsonSchema)]
 pub enum WiFiManagerResponse {
@@ -40,7 +40,7 @@ pub enum WiFiManagerEvent {
     /// Supplicant status updated
     StatusUpdated {
         iface: String,
-        status: SupplicantStatus,
+        status: Box<SupplicantStatus>,
     },
 }
 
@@ -205,45 +205,39 @@ pub enum WpaCommand {
     Unknown(String),
 }
 
-impl WpaCommand {
-    /// Convert command to string
-    pub fn to_string(&self) -> String {
+impl std::fmt::Display for WpaCommand {
+    /// Render the command as the wire string sent to wpa_supplicant.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            WpaCommand::Bss { addr } => format!("BSS {}", addr),
-            WpaCommand::Ping => "PING".to_string(),
-            WpaCommand::Scan => "SCAN".to_string(),
-            WpaCommand::ScanResults => "SCAN_RESULTS".to_string(),
-            WpaCommand::Status => "STATUS".to_string(),
-            WpaCommand::Set { key, value } => format!("SET {} {}", key, value),
-            WpaCommand::AddNetwork => "ADD_NETWORK".to_string(),
+            WpaCommand::Bss { addr } => write!(f, "BSS {}", addr),
+            WpaCommand::Ping => write!(f, "PING"),
+            WpaCommand::Scan => write!(f, "SCAN"),
+            WpaCommand::ScanResults => write!(f, "SCAN_RESULTS"),
+            WpaCommand::Status => write!(f, "STATUS"),
+            WpaCommand::Set { key, value } => write!(f, "SET {} {}", key, value),
+            WpaCommand::AddNetwork => write!(f, "ADD_NETWORK"),
             WpaCommand::SetNetwork { id, key, value } => {
-                format!("SET_NETWORK {} {} {}", id, key, value)
+                write!(f, "SET_NETWORK {} {} {}", id, key, value)
             }
             WpaCommand::GetNetwork { id, key } => {
-                format!("GET_NETWORK {} {}", id, key)
+                write!(f, "GET_NETWORK {} {}", id, key)
             }
-            WpaCommand::ListNetworks => "LIST_NETWORKS".to_string(),
-            WpaCommand::EnableNetwork { id } => {
-                format!("ENABLE_NETWORK {}", id)
-            }
-            WpaCommand::DisableNetwork { id } => {
-                format!("DISABLE_NETWORK {}", id)
-            }
-            WpaCommand::RemoveNetwork { id } => {
-                format!("REMOVE_NETWORK {}", id)
-            }
+            WpaCommand::ListNetworks => write!(f, "LIST_NETWORKS"),
+            WpaCommand::EnableNetwork { id } => write!(f, "ENABLE_NETWORK {}", id),
+            WpaCommand::DisableNetwork { id } => write!(f, "DISABLE_NETWORK {}", id),
+            WpaCommand::RemoveNetwork { id } => write!(f, "REMOVE_NETWORK {}", id),
             WpaCommand::SelectNetwork { id } => match id {
-                Some(id) => format!("SELECT_NETWORK {}", id),
-                None => "SELECT_NETWORK any".to_string(),
+                Some(id) => write!(f, "SELECT_NETWORK {}", id),
+                None => write!(f, "SELECT_NETWORK any"),
             },
-            WpaCommand::Reassociate => "REASSOCIATE".to_string(),
-            WpaCommand::Reconfigure => "RECONFIGURE".to_string(),
-            WpaCommand::Disconnect => "DISCONNECT".to_string(),
-            WpaCommand::Reconnect => "RECONNECT".to_string(),
-            WpaCommand::Attach => "ATTACH".to_string(),
-            WpaCommand::Detach => "DETACH".to_string(),
-            WpaCommand::SaveConfig => "SAVE_CONFIG".to_string(),
-            WpaCommand::Unknown(cmd) => cmd.clone(),
+            WpaCommand::Reassociate => write!(f, "REASSOCIATE"),
+            WpaCommand::Reconfigure => write!(f, "RECONFIGURE"),
+            WpaCommand::Disconnect => write!(f, "DISCONNECT"),
+            WpaCommand::Reconnect => write!(f, "RECONNECT"),
+            WpaCommand::Attach => write!(f, "ATTACH"),
+            WpaCommand::Detach => write!(f, "DETACH"),
+            WpaCommand::SaveConfig => write!(f, "SAVE_CONFIG"),
+            WpaCommand::Unknown(cmd) => write!(f, "{}", cmd),
         }
     }
 }

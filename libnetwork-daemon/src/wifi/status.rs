@@ -22,21 +22,24 @@ pub enum WpaState {
     Unknown,
 }
 
-impl WpaState {
-    /// Parse from string
-    pub fn from_str(s: &str) -> Self {
+impl std::str::FromStr for WpaState {
+    type Err = ();
+
+    /// Parse from string. Unknown values yield `Err(())`; callers that want a
+    /// lenient `Unknown` fallback should use `unwrap_or(WpaState::Unknown)`.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "COMPLETED" => Self::Completed,
-            "DISCONNECTED" => Self::Disconnected,
-            "SCANNING" => Self::Scanning,
-            "ASSOCIATING" => Self::Associating,
-            "ASSOCIATED" => Self::Associated,
-            "AUTHENTICATING" => Self::Authenticating,
-            "4WAY_HANDSHAKE" => Self::FourWayHandshake,
-            "GROUP_HANDSHAKE" => Self::GroupHandshake,
-            "INACTIVE" => Self::Inactive,
-            "INTERFACE_DISABLED" => Self::InterfaceDisabled,
-            _ => Self::Unknown,
+            "COMPLETED" => Ok(Self::Completed),
+            "DISCONNECTED" => Ok(Self::Disconnected),
+            "SCANNING" => Ok(Self::Scanning),
+            "ASSOCIATING" => Ok(Self::Associating),
+            "ASSOCIATED" => Ok(Self::Associated),
+            "AUTHENTICATING" => Ok(Self::Authenticating),
+            "4WAY_HANDSHAKE" => Ok(Self::FourWayHandshake),
+            "GROUP_HANDSHAKE" => Ok(Self::GroupHandshake),
+            "INACTIVE" => Ok(Self::Inactive),
+            "INTERFACE_DISABLED" => Ok(Self::InterfaceDisabled),
+            _ => Err(()),
         }
     }
 }
@@ -121,7 +124,10 @@ impl SupplicantStatus {
                         status.security = Some(Security::from_key_mgmt(value))
                     }
                     "wpa_state" => {
-                        status.state = Some(WpaState::from_str(value))
+                        status.state = Some(
+                            <WpaState as std::str::FromStr>::from_str(value)
+                                .unwrap_or(WpaState::Unknown),
+                        )
                     }
                     "ip_address" => status.ip_address = Some(value.to_string()),
                     "eap_session_id" | "eap_method" => {

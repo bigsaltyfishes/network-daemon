@@ -8,9 +8,9 @@ members = [
 
 [workspace.lints.clippy]
 new_without_default = { level = "allow", priority = -1 }
-correctness = { level = "deny", priority = -1 }
-complexity = { level = "deny", priority = -1 }
-pedantic = { level = "deny", priority = -1 }
+correctness = { level = "deny", priority = -2 }
+complexity = { level = "deny", priority = -2 }
+pedantic = { level = "deny", priority = -2 }
 single_call_fn = "deny"
 useless_attribute = "deny"
 redundant_pub_crate = "deny"
@@ -18,3 +18,10 @@ excessive_precision = "deny"
 missing_docs_in_private_items = "deny"
 absolute_paths = "deny"
 redundant_closure = "deny"
+
+[profile.release]
+strip = true
+lto = true
+opt-level = "z"
+codegen-units = 1
+panic = "abort"

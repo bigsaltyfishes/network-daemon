@@ -87,3 +87,62 @@ impl LeaseBuilder {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    fn base() -> LeaseBuilder {
+        LeaseBuilder::new()
+            .set_assigned_ip(Ipv4Addr::new(192, 168, 1, 50))
+            .set_server_id(Ipv4Addr::new(192, 168, 1, 1))
+            .set_subnet_mask(Ipv4Addr::new(255, 255, 255, 0))
+            .set_lease_time(3600)
+    }
+
+    #[test]
+    fn default_timers_are_fractions_of_lease() {
+        let lease = base().build().unwrap();
+        // T1 defaults to lease/2, T2 defaults to lease*7/8.
+        assert_eq!(lease.renewal_time, 1800);
+        assert_eq!(lease.rebinding_time, 3150);
+    }
+
+    #[test]
+    fn explicit_timers_are_preserved() {
+        let lease = base()
+            .set_renewal_time(100)
+            .set_rebinding_time(200)
+            .build()
+            .unwrap();
+        assert_eq!(lease.renewal_time, 100);
+        assert_eq!(lease.rebinding_time, 200);
+    }
+
+    #[test]
+    fn missing_required_fields_is_error() {
+        assert!(LeaseBuilder::new().build().is_err());
+        assert!(
+            LeaseBuilder::new()
+                .set_assigned_ip(Ipv4Addr::new(1, 2, 3, 4))
+                .build()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn round_trip_dns_and_router() {
+        let lease = base()
+            .set_router(Ipv4Addr::new(192, 168, 1, 1))
+            .add_dns_server(Ipv4Addr::new(8, 8, 8, 8))
+            .add_dns_server(Ipv4Addr::new(8, 8, 4, 4))
+            .build()
+            .unwrap();
+        assert_eq!(
+            lease.router,
+            Some(Ipv4Addr::new(192, 168, 1, 1))
+        );
+        assert_eq!(lease.dns_servers.len(), 2);
+    }
+}

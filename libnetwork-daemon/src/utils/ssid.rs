@@ -44,11 +44,11 @@ pub fn unescape_ssid(s: &str) -> String {
                     // Hex escape: \xNN
                     chars.next(); // consume 'x'
                     let hex: String = chars.by_ref().take(2).collect();
-                    if hex.len() == 2 {
-                        if let Ok(byte) = u8::from_str_radix(&hex, 16) {
-                            bytes.push(byte);
-                            continue;
-                        }
+                    if hex.len() == 2
+                        && let Ok(byte) = u8::from_str_radix(&hex, 16)
+                    {
+                        bytes.push(byte);
+                        continue;
                     }
                     // Invalid escape, keep as-is
                     bytes.push(b'\\');

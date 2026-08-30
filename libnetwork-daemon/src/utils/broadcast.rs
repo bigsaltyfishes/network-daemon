@@ -31,6 +31,15 @@ where
     senders: SegQueue<Sender<T>>,
 }
 
+impl<T> Default for Broadcast<T>
+where
+    T: Send + Clone,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T> Broadcast<T>
 where
     T: Send + Clone,
@@ -66,15 +75,12 @@ where
         let mut cnt = 0;
 
         while num > 0 {
-            if let Some(sender) = self.senders.pop() {
-                match sender.send(message.clone()).await {
-                    Ok(_) => {
-                        self.senders.push(sender);
-                        cnt += 1;
-                    }
-                    Err(_) => {} // Receiver dropped, do not re-add
-                }
-            }
+            if let Some(sender) = self.senders.pop()
+                && sender.send(message.clone()).await.is_ok()
+            {
+                self.senders.push(sender);
+                cnt += 1;
+            } // On failure the receiver dropped, so the sender is not re-added.
             num -= 1;
         }
 

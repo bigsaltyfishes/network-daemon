@@ -23,7 +23,9 @@ impl PrefixedIpv4Addr {
 
     /// Get net id
     pub fn net_id(&self) -> Self {
-        let mask = !0u32 << (32 - self.prefix_len);
+        // A prefix of 0 (default route) must clear all bits; a plain shift by
+        // `32 - 0 = 32` would overflow, so use a checked shift (None -> 0).
+        let mask = (!0u32).checked_shl(32 - self.prefix_len as u32).unwrap_or(0);
         let net_id = self.addr.to_bits() & mask;
         Self {
             addr: std::net::Ipv4Addr::from(net_id),
@@ -92,9 +94,9 @@ impl JsonSchema for PrefixedIpv4Addr {
     }
 }
 
-impl Into<PrefixedIpAddr> for PrefixedIpv4Addr {
-    fn into(self) -> PrefixedIpAddr {
-        PrefixedIpAddr::V4(self)
+impl From<PrefixedIpv4Addr> for PrefixedIpAddr {
+    fn from(addr: PrefixedIpv4Addr) -> Self {
+        PrefixedIpAddr::V4(addr)
     }
 }
 
@@ -117,7 +119,9 @@ impl PrefixedIpv6Addr {
 
     /// Get net id
     pub fn net_id(&self) -> Self {
-        let mask = !0u128 << (128 - self.prefix_len);
+        // A prefix of 0 (default route) must clear all bits; a plain shift by
+        // `128 - 0 = 128` would overflow, so use a checked shift (None -> 0).
+        let mask = (!0u128).checked_shl(128 - self.prefix_len as u32).unwrap_or(0);
         let net_id = self.addr.to_bits() & mask;
 
         Self {
@@ -172,9 +176,9 @@ impl<'de> Deserialize<'de> for PrefixedIpv6Addr {
     }
 }
 
-impl Into<PrefixedIpAddr> for PrefixedIpv6Addr {
-    fn into(self) -> PrefixedIpAddr {
-        PrefixedIpAddr::V6(self)
+impl From<PrefixedIpv6Addr> for PrefixedIpAddr {
+    fn from(addr: PrefixedIpv6Addr) -> Self {
+        PrefixedIpAddr::V6(addr)
     }
 }
 
@@ -226,5 +230,90 @@ impl IntoPrefixed<PrefixedIpv4Addr> for std::net::Ipv4Addr {
 impl IntoPrefixed<PrefixedIpv6Addr> for std::net::Ipv6Addr {
     fn into_prefixed(self, prefix_len: u8) -> PrefixedIpv6Addr {
         PrefixedIpv6Addr::new(self, prefix_len)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn v4_net_id_zero_prefix() {
+        let p = PrefixedIpv4Addr::new(Ipv4Addr::new(192, 168, 1, 5), 0);
+        assert_eq!(p.net_id(), PrefixedIpv4Addr::new(Ipv4Addr::UNSPECIFIED, 0));
+    }
+
+    #[test]
+    fn v4_net_id_masks_host_bits() {
+        let p = PrefixedIpv4Addr::new(Ipv4Addr::new(192, 168, 1, 55), 24);
+        assert_eq!(
+            p.net_id(),
+            PrefixedIpv4Addr::new(Ipv4Addr::new(192, 168, 1, 0), 24)
+        );
+    }
+
+    #[test]
+    fn v4_net_id_preserves_classful_high_bits() {
+        let p = PrefixedIpv4Addr::new(Ipv4Addr::new(10, 20, 30, 40), 8);
+        assert_eq!(
+            p.net_id(),
+            PrefixedIpv4Addr::new(Ipv4Addr::new(10, 0, 0, 0), 8)
+        );
+    }
+
+    #[test]
+    fn v4_net_id_full_prefix_is_identity() {
+        let addr = Ipv4Addr::new(203, 0, 113, 9);
+        let p = PrefixedIpv4Addr::new(addr, 32);
+        assert_eq!(p.net_id(), p);
+    }
+
+    #[test]
+    fn v6_net_id_masks_host_bits() {
+        let p =
+            PrefixedIpv6Addr::new(Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, 1), 64);
+        assert_eq!(
+            p.net_id(),
+            PrefixedIpv6Addr::new(
+                Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, 0),
+                64
+            )
+        );
+    }
+
+    #[test]
+    fn v6_net_id_default_route_prefix() {
+        let p = PrefixedIpv6Addr::new(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 0);
+        assert_eq!(p.net_id(), PrefixedIpv6Addr::UNSPECIFIED);
+    }
+
+    #[test]
+    fn v4_unspecified_constant() {
+        assert_eq!(
+            PrefixedIpv4Addr::UNSPECIFIED,
+            PrefixedIpv4Addr::new(Ipv4Addr::UNSPECIFIED, 0)
+        );
+    }
+
+    #[test]
+    fn display_round_trip() {
+        let a = PrefixedIpv4Addr::new(Ipv4Addr::new(192, 168, 1, 5), 24);
+        assert_eq!(a.to_string(), "192.168.1.5/24");
+        let ser = serde_json::to_string(&a).unwrap();
+        assert_eq!(ser, "\"192.168.1.5/24\"");
+        let de: PrefixedIpv4Addr = serde_json::from_str(&ser).unwrap();
+        assert_eq!(de, a);
+    }
+
+    #[test]
+    fn v6_display_round_trip() {
+        let a = PrefixedIpv6Addr::new(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, 1),
+            64,
+        );
+        let ser = serde_json::to_string(&a).unwrap();
+        let de: PrefixedIpv6Addr = serde_json::from_str(&ser).unwrap();
+        assert_eq!(de, a);
     }
 }

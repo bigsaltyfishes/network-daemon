@@ -185,8 +185,9 @@ impl WpaEvent {
                 .and_then(|s| s.split_whitespace().next())
                 .unwrap_or("")
                 .to_string();
+            // The new state is under `state=` (not `new_state=`).
             let new = msg
-                .split("new_state=")
+                .split("state=")
                 .nth(1)
                 .and_then(|s| s.split_whitespace().next())
                 .unwrap_or("")
@@ -296,6 +297,84 @@ mod tests {
         assert_eq!(
             event,
             WpaEvent::Unknown("SOME-UNKNOWN-EVENT data".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_bss_removed() {
+        let raw = "<3>CTRL-EVENT-BSS-REMOVED 117 78:44:fd:4d:c2:b2";
+        assert_eq!(
+            WpaEvent::parse(raw),
+            WpaEvent::BssRemoved {
+                bssid: "78:44:fd:4d:c2:b2".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_state_change() {
+        let raw =
+            "<3>CTRL-EVENT-STATE-CHANGE id=0 state=COMPLETED old_state=SCANNING";
+        assert_eq!(
+            WpaEvent::parse(raw),
+            WpaEvent::StateChange {
+                old: "SCANNING".to_string(),
+                new: "COMPLETED".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_disconnected_without_reason() {
+        let raw = "<2>CTRL-EVENT-DISCONNECTED bssid=aa:bb:cc:dd:ee:ff";
+        assert_eq!(
+            WpaEvent::parse(raw),
+            WpaEvent::Disconnected {
+                bssid: Some("aa:bb:cc:dd:ee:ff".to_string()),
+                reason: None
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_scan_started_and_failed() {
+        assert_eq!(
+            WpaEvent::parse("CTRL-EVENT-SCAN-STARTED"),
+            WpaEvent::ScanStarted
+        );
+        assert_eq!(
+            WpaEvent::parse("CTRL-EVENT-SCAN-FAILED ret=-1"),
+            WpaEvent::ScanFailed
+        );
+    }
+
+    #[test]
+    fn test_parse_ok() {
+        assert_eq!(WpaEvent::parse("OK"), WpaEvent::Ok);
+    }
+
+    #[test]
+    fn test_parse_priority_less_connected() {
+        // Some wpa_supplicant builds omit the <N> priority prefix.
+        let raw = "CTRL-EVENT-CONNECTED - Connection to 11:22:33:44:55:66 completed";
+        assert_eq!(
+            WpaEvent::parse(raw),
+            WpaEvent::Connected {
+                bssid: "11:22:33:44:55:66".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_temp_disabled_unknown_reason() {
+        let raw =
+            "<3>CTRL-EVENT-SSID-TEMP-DISABLED id=0 ssid=\"X\" reason=NOPE";
+        assert_eq!(
+            WpaEvent::parse(raw),
+            WpaEvent::TempDisabled {
+                ssid: "X".to_string(),
+                reason: WpaTempDisabledReason::Unknown("NOPE".to_string())
+            }
         );
     }
 }

@@ -332,17 +332,28 @@ impl ScanResult {
     }
 }
 
-/// Sort scan results by signal strength (descending)
+/// Sort scan results by signal strength (descending).
+///
+/// Public library helper for scan-result presentation; consumed by the
+/// network-manager-tui crate (planned in a later phase), hence not exercised
+/// internally by this crate.
+#[allow(dead_code)]
 pub fn sort_by_signal(results: &mut [ScanResult]) {
-    results.sort_by(|a, b| b.signal.cmp(&a.signal));
+    results.sort_by_key(|r| std::cmp::Reverse(r.signal));
 }
 
-/// Sort known networks by priority (descending)
+/// Sort known networks by priority (descending).
+///
+/// Public library helper; consumed by the network-manager-tui crate.
+#[allow(dead_code)]
 pub fn sort_by_priority(networks: &mut [KnownNetwork]) {
-    networks.sort_by(|a, b| b.priority.cmp(&a.priority));
+    networks.sort_by_key(|n| std::cmp::Reverse(n.priority));
 }
 
-/// Filter scan results by SSID (case-insensitive substring match)
+/// Filter scan results by SSID (case-insensitive substring match).
+///
+/// Public library helper; consumed by the network-manager-tui crate.
+#[allow(dead_code)]
 pub fn filter_by_ssid(
     results: Vec<ScanResult>,
     filter: &str,
@@ -354,7 +365,10 @@ pub fn filter_by_ssid(
         .collect()
 }
 
-/// Filter known networks by SSID (case-insensitive substring match)
+/// Filter known networks by SSID (case-insensitive substring match).
+///
+/// Public library helper; consumed by the network-manager-tui crate.
+#[allow(dead_code)]
 pub fn filter_known_by_ssid(
     networks: Vec<KnownNetwork>,
     filter: &str,
