@@ -1,29 +1,29 @@
 //! network-manager-tui: a terminal UI for the network daemon.
 //!
-//! Connects to the daemon's control socket (`/var/run/network-daemon/network-daemon.sock`)
-//! and lets the user list interfaces, scan for Wi-Fi, and manage known networks.
+//! Connects to the daemon's control socket and lets the user manage interfaces,
+//! scan / connect to Wi-Fi, and edit saved networks — aligned with nmtui.
 
 mod app;
 mod client;
 
 use std::{
     io::{self, Stdout},
+    net::Ipv4Addr,
     path::PathBuf,
     time::Duration,
 };
 
-use app::{App, View};
+use app::{App, Form, Modal, View};
 use client::DaemonClient;
-use crossterm::{
-    ExecutableCommand,
-    event::{Event, KeyCode, KeyEventKind, poll, read},
-    terminal::{
-        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
-        enable_raw_mode,
-    },
+use crossterm::ExecutableCommand;
+use crossterm::event::{Event, KeyCode, KeyEventKind, poll, read};
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+    enable_raw_mode,
 };
 use libnetwork_daemon::{
-    DaemonCommand, InterfaceManagerAction, WiFiManagerAction,
+    DaemonCommand, DaemonResponse, InterfaceManagerAction, InterfaceResponse,
+    MacAddr, Modification, PrefixedIpv4Addr, ScanResult, Security, WpaState,
 };
 use ratatui::Terminal;
 
@@ -41,8 +41,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             |_| "/var/run/network-daemon/network-daemon.sock".to_string(),
         ));
 
-    // Connect. On a permission error, guide the user to the `network` group
-    // (the daemon socket is restricted to that group).
     let mut client = match DaemonClient::connect(&socket) {
         Ok(c) => c,
         Err(e) => {
@@ -67,31 +65,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // Pull initial data (best-effort): if the daemon is degraded we still start
-    // the TUI and show a status message rather than exiting blank.
     let mut app = App::default();
-    if let Ok(interfaces) = client.request(&DaemonCommand::InterfaceManager {
-        action: InterfaceManagerAction::GetAllInterfaces,
-    }) {
-        if let libnetwork_daemon::DaemonResponse::InterfaceManager {
-            response: libnetwork_daemon::InterfaceResponse::InfoList(list),
-        } = interfaces
-        {
-            app.interfaces = list;
-        }
-    } else {
-        app.error =
-            Some("failed to fetch interfaces (is the daemon running?)".into());
-    }
+    refresh_interfaces(&mut client, &mut app);
+    refresh_wifi(&mut client, &mut app);
 
-    // Set the TUI into raw mode / alternate screen.
     let mut stdout: Stdout = io::stdout();
     enable_raw_mode()?;
     stdout.execute(EnterAlternateScreen)?;
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Write a probe to stderr so it doesn't corrupt the TUI.
     eprintln!("network-manager-tui: connected to {:?}", socket);
 
     let result = event_loop(&mut terminal, &mut app, &mut client);
@@ -100,7 +83,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     result
 }
 
-/// The main terminal event loop.
+/// Main terminal event loop.
 fn event_loop(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
     app: &mut App,
@@ -109,119 +92,530 @@ fn event_loop(
     loop {
         terminal.draw(|f| f.render_widget(&*app, f.area()))?;
 
-        if !poll(Duration::from_millis(250))? {
+        if matches!(app.modal, Modal::Connecting { .. }) {
+            poll_connection(client, app);
+        }
+
+        if !poll(Duration::from_millis(200))? {
             continue;
         }
         let event = read()?;
         if let Event::Key(key) = event
             && key.kind == KeyEventKind::Press
         {
-            match key.code {
-                KeyCode::Char('q') => return Ok(()),
-                KeyCode::Char('i') => app.view = View::Interfaces,
-                KeyCode::Char('w') => app.view = View::ScanResults,
-                KeyCode::Char('n') => app.view = View::Networks,
-                KeyCode::Char('s') => {
-                    if let Some(iface) =
-                        app.interfaces.get(app.interface_selected)
-                    {
-                        let name = iface.name.clone();
-                        on_scan(client, app, &name);
-                    }
-                }
-                KeyCode::Char('c') => {
-                    if let Some(iface) =
-                        app.interfaces.get(app.interface_selected)
-                    {
-                        let name = iface.name.clone();
-                        on_connect(client, app, &name);
-                    }
-                }
-                KeyCode::Down => match app.view {
-                    View::Interfaces => {
-                        app.interface_selected = (app.interface_selected + 1)
-                            .min(app.interfaces.len().saturating_sub(1));
-                    }
-                    View::ScanResults | View::Networks => {
-                        let len = match app.view {
-                            View::ScanResults => app.scan_results.len(),
-                            _ => app.known_networks.len(),
-                        };
-                        app.network_selected = (app.network_selected + 1)
-                            .min(len.saturating_sub(1));
-                    }
-                },
-                KeyCode::Up => match app.view {
-                    View::Interfaces => {
-                        app.interface_selected =
-                            app.interface_selected.saturating_sub(1);
-                    }
-                    View::ScanResults | View::Networks => {
-                        app.network_selected =
-                            app.network_selected.saturating_sub(1);
-                    }
-                },
-                KeyCode::Char('r') => {
-                    app.interfaces = match client.request(&DaemonCommand::InterfaceManager {
-                            action: InterfaceManagerAction::GetAllInterfaces,
-                        }) {
-                            Ok(libnetwork_daemon::DaemonResponse::InterfaceManager {
-                                response: libnetwork_daemon::InterfaceResponse::InfoList(l),
-                            }) => l,
-                            _ => app.interfaces.clone(),
-                        };
-                }
-                _ => {}
+            if !matches!(app.modal, Modal::None) {
+                handle_modal_key(key.code, app, client);
+            } else {
+                handle_view_key(key.code, app, client);
             }
         }
     }
 }
 
-/// Trigger a Wi-Fi scan and cache results.
-fn on_scan(client: &mut DaemonClient, app: &mut App, iface: &str) {
-    app.status = format!("Scanning {}...", iface);
-    let result = client.request(&DaemonCommand::WiFiManager {
-        iface: iface.to_string(),
-        action: WiFiManagerAction::ScanResults,
-    });
-    match result {
-        Ok(libnetwork_daemon::DaemonResponse::WiFiManager {
-            response:
-                libnetwork_daemon::WiFiManagerResponse::ScanResults(results),
-            ..
-        }) => {
-            app.scan_results = results;
-            app.status =
-                format!("{} results for {}", app.scan_results.len(), iface);
-        }
-        Ok(_) => {
-            app.error = Some("Scan returned unexpected response".to_string())
-        }
-        Err(e) => app.error = Some(format!("Scan failed for {iface}: {e}")),
+/// Key handling when no modal is open.
+fn handle_view_key(key: KeyCode, app: &mut App, client: &mut DaemonClient) {
+    match app.view {
+        View::Interfaces => match key {
+            KeyCode::Char('q') => std::process::exit(0),
+            KeyCode::Down => {
+                app.interface_selected = (app.interface_selected + 1)
+                    .min(app.interfaces.len().saturating_sub(1));
+            }
+            KeyCode::Up => {
+                app.interface_selected =
+                    app.interface_selected.saturating_sub(1);
+            }
+            KeyCode::Enter => enter_interface(app, client),
+            KeyCode::Char('r') => refresh_interfaces(client, app),
+            KeyCode::Char('e') => edit_interface(app),
+            _ => {}
+        },
+        View::Wifi => match key {
+            KeyCode::Char('q') => std::process::exit(0),
+            KeyCode::Char('w') | KeyCode::Esc => app.view = View::Interfaces,
+            KeyCode::Down => {
+                app.network_selected = (app.network_selected + 1)
+                    .min(app.scan_results.len().saturating_sub(1));
+            }
+            KeyCode::Up => {
+                app.network_selected = app.network_selected.saturating_sub(1);
+            }
+            KeyCode::Char('s') => scan(client, app),
+            KeyCode::Enter => wifi_connect(app, client),
+            KeyCode::Char('e') => edit_wifi_ap(app, client),
+            KeyCode::Char('r') => refresh_wifi(client, app),
+            _ => {}
+        },
+        View::Networks => match key {
+            KeyCode::Char('q') => std::process::exit(0),
+            KeyCode::Char('n') | KeyCode::Esc => app.view = View::Interfaces,
+            KeyCode::Down => {
+                app.network_selected = (app.network_selected + 1)
+                    .min(app.known_networks.len().saturating_sub(1));
+            }
+            KeyCode::Up => {
+                app.network_selected = app.network_selected.saturating_sub(1);
+            }
+            KeyCode::Char('e') => edit_known_ap(app, client),
+            KeyCode::Char('r') => refresh_wifi(client, app),
+            _ => {}
+        },
     }
 }
 
-/// Connect to a Wi-Fi network (by the selected scan result, if any).
-fn on_connect(client: &mut DaemonClient, app: &mut App, iface: &str) {
-    let Some(ssid) = app
-        .scan_results
-        .get(app.network_selected)
-        .map(|r| r.ssid.clone())
+/// Key handling when a modal is open.
+fn handle_modal_key(key: KeyCode, app: &mut App, client: &mut DaemonClient) {
+    match &mut app.modal {
+        Modal::Message { .. } => match key {
+            KeyCode::Enter | KeyCode::Esc => app.modal = Modal::None,
+            _ => {}
+        },
+        Modal::Connecting { .. } => {
+            if key == KeyCode::Esc {
+                app.modal = Modal::None;
+            }
+        }
+        Modal::Password { input, .. } => match key {
+            KeyCode::Char(c) => input.push(c),
+            KeyCode::Backspace => {
+                input.pop();
+            }
+            KeyCode::Enter => password_confirm(app, client),
+            KeyCode::Esc => app.modal = Modal::None,
+            _ => {}
+        },
+        Modal::Edit { form, .. } => match key {
+            KeyCode::Down => {
+                form.focus =
+                    (form.focus + 1).min(form.fields.len().saturating_sub(1));
+            }
+            KeyCode::Up => {
+                form.focus = form.focus.saturating_sub(1);
+            }
+            KeyCode::Char(' ') => toggle_field(form),
+            KeyCode::Char('y') => set_toggle(form, true),
+            KeyCode::Char('n') => set_toggle(form, false),
+            KeyCode::Backspace => {
+                form.current().value.pop();
+            }
+            KeyCode::Char(c) => form.current().value.push(c),
+            KeyCode::Enter => edit_confirm(app, client),
+            KeyCode::Esc => app.modal = Modal::None,
+            _ => {}
+        },
+        Modal::None => {}
+    }
+}
+
+fn toggle_field(form: &mut Form) {
+    let f = form.current();
+    if f.value == "yes" {
+        f.value = "no".into();
+    } else if f.value == "no" {
+        f.value = "yes".into();
+    } else if !f.password {
+        f.value.push(' ');
+    }
+}
+
+fn set_toggle(form: &mut Form, value: bool) {
+    let f = form.current();
+    if f.value == "yes" || f.value == "no" {
+        f.value = if value { "yes".into() } else { "no".into() };
+    } else if !f.password {
+        f.value.push(if value { 'y' } else { 'n' });
+    }
+}
+
+/// Pressing Enter on an interface: go into Wi-Fi for wlan, else toggle up/down.
+fn enter_interface(app: &mut App, client: &mut DaemonClient) {
+    let Some(iface) = app.interfaces.get(app.interface_selected).cloned()
     else {
-        app.error = Some("No network selected to connect".into());
         return;
     };
-    match client.request(&DaemonCommand::WiFiManager {
-        iface: iface.to_string(),
-        action: WiFiManagerAction::Connect { ssid, bssid: None },
+    if iface.is_wlan() {
+        app.view = View::Wifi;
+        refresh_wifi(client, app);
+        return;
+    }
+    let up = iface.state.is_up();
+    let action = InterfaceManagerAction::ModLink {
+        name: iface.name.clone(),
+        ipv4: Modification::NoChange,
+        ipv6: Modification::NoChange,
+        oper_state: Modification::Replace(!up),
+        slaac: Modification::NoChange,
+    };
+    send_interface_action(client, action);
+    refresh_interfaces(client, app);
+}
+
+/// Open the interface-edit modal for the selected interface.
+fn edit_interface(app: &mut App) {
+    let Some(iface) = app.interfaces.get(app.interface_selected).cloned()
+    else {
+        return;
+    };
+    let form = App::interface_form(&iface);
+    app.modal = Modal::Edit {
+        title: "Edit Interface".into(),
+        iface: iface.name.clone(),
+        form,
+    };
+}
+
+/// Scan the selected wlan interface.
+fn scan(client: &mut DaemonClient, app: &mut App) {
+    let Some(iface) = app.interfaces.get(app.interface_selected).cloned()
+    else {
+        app.error = Some("select a wlan interface first".into());
+        return;
+    };
+    app.status = format!("Scanning {}...", iface.name);
+    if let Err(e) = client.request(&DaemonCommand::WiFiManager {
+        iface: iface.name.clone(),
+        action: libnetwork_daemon::WiFiManagerAction::Scan,
     }) {
-        Ok(libnetwork_daemon::DaemonResponse::WiFiManager {
-            response: libnetwork_daemon::WiFiManagerResponse::Success(()),
-            ..
-        }) => {
-            app.status = format!("Connecting on {iface}");
+        app.error = Some(format!("Scan failed: {e}"));
+        return;
+    }
+    fetch_scan_results(client, app, &iface.name);
+}
+
+/// Refresh wlan status + scan results + known networks.
+fn refresh_wifi(client: &mut DaemonClient, app: &mut App) {
+    let Some(iface) = app.interfaces.get(app.interface_selected).cloned()
+    else {
+        return;
+    };
+    if !iface.is_wlan() {
+        return;
+    }
+    fetch_scan_results(client, app, &iface.name);
+    fetch_status(client, app, &iface.name);
+    fetch_known_networks(client, app, &iface.name);
+}
+
+fn fetch_scan_results(client: &mut DaemonClient, app: &mut App, iface: &str) {
+    if let Ok(DaemonResponse::WiFiManager {
+        response: libnetwork_daemon::WiFiManagerResponse::ScanResults(results),
+        ..
+    }) = client.request(&DaemonCommand::WiFiManager {
+        iface: iface.to_string(),
+        action: libnetwork_daemon::WiFiManagerAction::ScanResults,
+    }) {
+        app.scan_results = results;
+    }
+}
+
+fn fetch_status(client: &mut DaemonClient, app: &mut App, iface: &str) {
+    if let Ok(DaemonResponse::WiFiManager {
+        response: libnetwork_daemon::WiFiManagerResponse::Status(status),
+        ..
+    }) = client.request(&DaemonCommand::WiFiManager {
+        iface: iface.to_string(),
+        action: libnetwork_daemon::WiFiManagerAction::Status,
+    }) {
+        app.wifi_status = Some(status);
+    }
+}
+
+fn fetch_known_networks(client: &mut DaemonClient, app: &mut App, iface: &str) {
+    if let Ok(DaemonResponse::WiFiManager {
+        response: libnetwork_daemon::WiFiManagerResponse::KnownNetworks(nets),
+        ..
+    }) = client.request(&DaemonCommand::WiFiManager {
+        iface: iface.to_string(),
+        action: libnetwork_daemon::WiFiManagerAction::KnownNetworks,
+    }) {
+        app.known_networks = nets;
+    }
+}
+
+/// Connect to the selected scan result.
+fn wifi_connect(app: &mut App, client: &mut DaemonClient) {
+    let Some(iface) = app.interfaces.get(app.interface_selected).cloned()
+    else {
+        return;
+    };
+    let Some(scan) = app.scan_results.get(app.network_selected).cloned() else {
+        app.error = Some("no network selected".into());
+        return;
+    };
+
+    let is_known = app.known_networks.iter().any(|n| {
+        n.ssid == scan.ssid
+            && n.bssid.map(|b| b.to_string()) == Some(scan.bssid.to_string())
+    });
+    if is_known {
+        connect(app, client, iface.name, scan.ssid, Some(scan.bssid), None);
+        return;
+    }
+    if scan.security == Security::Open {
+        add_and_connect(app, client, iface.name, scan, Security::Open, None);
+        return;
+    }
+    app.modal = Modal::Password {
+        ssid: scan.ssid.clone(),
+        bssid: Some(scan.bssid.to_string()),
+        iface: iface.name,
+        input: String::new(),
+    };
+}
+
+/// Submit a password from the modal.
+fn password_confirm(app: &mut App, client: &mut DaemonClient) {
+    let (ssid, bssid_str, iface, pwd) = match &app.modal {
+        Modal::Password {
+            ssid,
+            bssid,
+            iface,
+            input,
+        } => (ssid.clone(), bssid.clone(), iface.clone(), input.clone()),
+        _ => return,
+    };
+    let scan = app
+        .scan_results
+        .iter()
+        .find(|r| {
+            r.ssid == ssid
+                && r.bssid.to_string() == bssid_str.clone().unwrap_or_default()
+        })
+        .cloned();
+    match scan {
+        Some(s) => {
+            let security = s.security;
+            add_and_connect(app, client, iface, s, security, Some(pwd))
         }
-        Ok(_) => app.error = Some(format!("Connect handled for {iface}")),
-        Err(e) => app.error = Some(format!("Connect error: {e}")),
+        None => {
+            app.modal = Modal::Message {
+                title: "Error".into(),
+                message: "network not in scan results".into(),
+            }
+        }
+    }
+}
+
+/// Start a connection (known network).
+fn connect(
+    app: &mut App,
+    client: &mut DaemonClient,
+    iface: String,
+    ssid: String,
+    bssid: Option<MacAddr>,
+    _pwd: Option<String>,
+) {
+    let name = ssid.clone();
+    match client.request(&DaemonCommand::WiFiManager {
+        iface: iface.clone(),
+        action: libnetwork_daemon::WiFiManagerAction::Connect { ssid, bssid },
+    }) {
+        Ok(_) => {
+            app.modal = Modal::Connecting { ssid: name.clone() };
+            app.status = format!("Connecting {name}...");
+        }
+        Err(e) => {
+            app.modal = Modal::Message {
+                title: "Connect failed".into(),
+                message: format!("{e}"),
+            }
+        }
+    }
+}
+
+/// Add a network then connect.
+fn add_and_connect(
+    app: &mut App,
+    client: &mut DaemonClient,
+    iface: String,
+    scan: ScanResult,
+    _security: Security,
+    password: Option<String>,
+) {
+    let bssid = Some(scan.bssid);
+    let _ = client.request(&DaemonCommand::WiFiManager {
+        iface: iface.clone(),
+        action: libnetwork_daemon::WiFiManagerAction::AddNetwork {
+            ssid: scan.ssid.clone(),
+            bssid,
+            security: scan.security,
+            password,
+            identity: None,
+            hidden: false,
+        },
+    });
+    let _ = client.request(&DaemonCommand::WiFiManager {
+        iface: iface.clone(),
+        action: libnetwork_daemon::WiFiManagerAction::Connect {
+            ssid: scan.ssid.clone(),
+            bssid,
+        },
+    });
+    app.modal = Modal::Connecting {
+        ssid: scan.ssid.clone(),
+    };
+    app.status = format!("Connecting {}...", scan.ssid);
+}
+
+/// Poll supplicant status while Connecting, closing modal when done/failed.
+fn poll_connection(client: &mut DaemonClient, app: &mut App) {
+    let Some(iface) = app.interfaces.get(app.interface_selected).cloned()
+    else {
+        return;
+    };
+    if !iface.is_wlan() {
+        return;
+    }
+    fetch_status(client, app, &iface.name);
+    match &app.wifi_status {
+        Some(s) if matches!(s.state, Some(WpaState::Completed)) => {
+            app.modal = Modal::None;
+            app.status = "Connected".into();
+        }
+        Some(s)
+            if matches!(
+                s.state,
+                Some(WpaState::Disconnected)
+                    | Some(WpaState::InterfaceDisabled)
+            ) =>
+        {
+            let msg = format!(
+                "Connection failed (state {:?})",
+                s.state.unwrap_or(WpaState::Unknown)
+            );
+            app.modal = Modal::Message {
+                title: "Connect failed".into(),
+                message: msg,
+            };
+        }
+        _ => {}
+    }
+}
+
+/// Open the edit-AP modal for a scan result (from the Wi-Fi view).
+fn edit_wifi_ap(app: &mut App, client: &mut DaemonClient) {
+    let Some(iface) = app.interfaces.get(app.interface_selected).cloned()
+    else {
+        return;
+    };
+    let Some(scan) = app.scan_results.get(app.network_selected).cloned() else {
+        app.error = Some("no network to edit".into());
+        return;
+    };
+    let form = App::ap_form_from_scan(&scan);
+    app.modal = Modal::Edit {
+        title: "Edit Network".into(),
+        iface: iface.name,
+        form,
+    };
+    let _ = client;
+}
+
+/// Open the edit-AP modal for a known network (Networks view).
+fn edit_known_ap(app: &mut App, client: &mut DaemonClient) {
+    let Some(iface) = app.interfaces.get(app.interface_selected).cloned()
+    else {
+        return;
+    };
+    let Some(net) = app.known_networks.get(app.network_selected).cloned()
+    else {
+        app.error = Some("no known network to edit".into());
+        return;
+    };
+    let form = App::ap_form(&net);
+    app.modal = Modal::Edit {
+        title: "Edit Network".into(),
+        iface: iface.name,
+        form,
+    };
+    let _ = client;
+}
+
+/// Submit an edit form (interface or AP).
+fn edit_confirm(app: &mut App, client: &mut DaemonClient) {
+    let (title, iface, form) = match std::mem::take(&mut app.modal) {
+        Modal::Edit { title, iface, form } => (title, iface, form),
+        _ => return,
+    };
+    if title.starts_with("Edit Interface") {
+        apply_interface_edit(client, iface, form);
+    } else {
+        apply_ap_edit(client, iface, form);
+    }
+}
+
+/// Apply an interface-edit form (DHCP / SLAAC / static IPv4).
+fn apply_interface_edit(client: &mut DaemonClient, iface: String, form: Form) {
+    let v4 = form.fields[0].value.trim().to_string();
+    let slaac = form.fields[1].value == "yes";
+
+    let ipv4 = if v4.is_empty() {
+        Modification::NoChange
+    } else {
+        match parse_prefixed_v4(&v4) {
+            Some(p) => Modification::Replace(p),
+            None => Modification::NoChange,
+        }
+    };
+
+    let action = InterfaceManagerAction::ModLink {
+        name: iface,
+        ipv4,
+        ipv6: Modification::NoChange,
+        oper_state: Modification::NoChange,
+        slaac: Modification::Replace(slaac),
+    };
+    send_interface_action(client, action);
+}
+
+/// Apply an AP-edit form (BSSID / password / auto-connect).
+fn apply_ap_edit(client: &mut DaemonClient, iface: String, form: Form) {
+    let ssid = form.fields[0].value.clone();
+    let bssid_val = form.fields[1].value.trim().to_string();
+    let pwd = form.fields[2].value.clone();
+    let bssid = MacAddr::parse(&bssid_val);
+    let _ = client.request(&DaemonCommand::WiFiManager {
+        iface,
+        action: libnetwork_daemon::WiFiManagerAction::AddNetwork {
+            ssid,
+            bssid,
+            security: if pwd.is_empty() {
+                Security::Open
+            } else {
+                Security::Psk
+            },
+            password: if pwd.is_empty() { None } else { Some(pwd) },
+            identity: None,
+            hidden: false,
+        },
+    });
+}
+
+/// Parse "a.b.c.d/prefix" into a PrefixedIpv4Addr.
+fn parse_prefixed_v4(s: &str) -> Option<PrefixedIpv4Addr> {
+    let (ip, prefix) = s.split_once('/')?;
+    let addr: Ipv4Addr = ip.parse().ok()?;
+    let prefix: u8 = prefix.parse().ok()?;
+    Some(PrefixedIpv4Addr::new(addr, prefix))
+}
+
+fn send_interface_action(
+    client: &mut DaemonClient,
+    action: InterfaceManagerAction,
+) {
+    if let Err(e) = client.request(&DaemonCommand::InterfaceManager { action })
+    {
+        eprintln!("interface action failed: {e}");
+    }
+}
+
+/// Refresh the interface list into the app.
+fn refresh_interfaces(client: &mut DaemonClient, app: &mut App) {
+    if let Ok(DaemonResponse::InterfaceManager {
+        response: InterfaceResponse::InfoList(list),
+    }) = client.request(&DaemonCommand::InterfaceManager {
+        action: InterfaceManagerAction::GetAllInterfaces,
+    }) {
+        app.interfaces = list;
     }
 }
