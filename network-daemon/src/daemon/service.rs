@@ -156,6 +156,30 @@ where
             })?,
         ));
 
+        // Restrict the control socket to the `network` group (owned by
+        // network:network, mode 0660). The daemon runs as root so it can
+        // chown. If the group is absent we still set 0660 so only root /
+        // group members (or the owner) can connect.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let set_group = match nix::unistd::Group::from_name("network") {
+                Ok(Some(g)) => {
+                    nix::unistd::chown(&socket_path, None, Some(g.gid)).is_ok()
+                }
+                _ => false,
+            };
+            if let Ok(meta) = std::fs::metadata(&socket_path) {
+                let mut perms = meta.permissions();
+                perms.set_mode(0o660);
+                std::fs::set_permissions(&socket_path, perms).ok();
+            }
+            if !set_group {
+                info!(
+                    "Socket restricted to mode 0660; 'network' group not applied"
+                );
+            }
+        }
+
         actor_ref.attach_stream(listener, (), ());
 
         info!("NetworkDaemon started, listening on {:?}", socket_path);
