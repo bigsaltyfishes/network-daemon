@@ -41,18 +41,47 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             |_| "/var/run/network-daemon/network-daemon.sock".to_string(),
         ));
 
-    let mut client = DaemonClient::connect(&socket)?;
+    // Connect. On a permission error, guide the user to the `network` group
+    // (the daemon socket is restricted to that group).
+    let mut client = match DaemonClient::connect(&socket) {
+        Ok(c) => c,
+        Err(e) => {
+            use client::ClientError;
+            let hint = match &e {
+                ClientError::Connect(io)
+                    if io.kind() == std::io::ErrorKind::PermissionDenied =>
+                {
+                    "\n  Hint: you must be a member of the 'network' group\n  to talk to the daemon. Add yourself, e.g.:\n    sudo pw groupmod network -m $USER\n  then log out/in (or reconnect SSH) for it to take effect."
+                }
+                _ => {
+                    "\n  Hint: is the network-daemon running? (sudo service network-daemon start)"
+                }
+            };
+            eprintln!(
+                "failed to connect to daemon at {}: {}",
+                socket.display(),
+                e
+            );
+            eprintln!("{hint}");
+            return Ok(());
+        }
+    };
 
-    // Pull initial data.
+    // Pull initial data (best-effort): if the daemon is degraded we still start
+    // the TUI and show a status message rather than exiting blank.
     let mut app = App::default();
-    let interfaces = client.request(&DaemonCommand::InterfaceManager {
+    if let Ok(interfaces) = client.request(&DaemonCommand::InterfaceManager {
         action: InterfaceManagerAction::GetAllInterfaces,
-    })?;
-    if let libnetwork_daemon::DaemonResponse::InterfaceManager {
-        response: libnetwork_daemon::InterfaceResponse::InfoList(list),
-    } = interfaces
-    {
-        app.interfaces = list;
+    }) {
+        if let libnetwork_daemon::DaemonResponse::InterfaceManager {
+            response: libnetwork_daemon::InterfaceResponse::InfoList(list),
+        } = interfaces
+        {
+            app.interfaces = list;
+        }
+    } else {
+        app.error =
+            Some("failed to fetch interfaces (is the daemon running?)".into());
     }
 
     // Set the TUI into raw mode / alternate screen.
