@@ -90,6 +90,7 @@ fn event_loop(
             match key.code {
                 KeyCode::Char('q') => return Ok(()),
                 KeyCode::Char('i') => app.view = View::Interfaces,
+                KeyCode::Char('w') => app.view = View::ScanResults,
                 KeyCode::Char('n') => app.view = View::Networks,
                 KeyCode::Char('s') => {
                     if let Some(iface) =
@@ -112,9 +113,13 @@ fn event_loop(
                         app.interface_selected = (app.interface_selected + 1)
                             .min(app.interfaces.len().saturating_sub(1));
                     }
-                    View::Networks => {
+                    View::ScanResults | View::Networks => {
+                        let len = match app.view {
+                            View::ScanResults => app.scan_results.len(),
+                            _ => app.known_networks.len(),
+                        };
                         app.network_selected = (app.network_selected + 1)
-                            .min(app.known_networks.len().saturating_sub(1));
+                            .min(len.saturating_sub(1));
                     }
                 },
                 KeyCode::Up => match app.view {
@@ -122,7 +127,7 @@ fn event_loop(
                         app.interface_selected =
                             app.interface_selected.saturating_sub(1);
                     }
-                    View::Networks => {
+                    View::ScanResults | View::Networks => {
                         app.network_selected =
                             app.network_selected.saturating_sub(1);
                     }

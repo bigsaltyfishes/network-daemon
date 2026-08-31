@@ -14,6 +14,8 @@ use ratatui::{
 pub enum View {
     #[default]
     Interfaces,
+    /// Wi-Fi scan results for the selected interface.
+    ScanResults,
     Networks,
 }
 
@@ -56,16 +58,23 @@ impl App {
                     .first()
                     .map(|a| a.to_string())
                     .unwrap_or_else(|| "-".into());
-                let sec = if i.is_wlan() { " wifi" } else { "" };
+                let iftype = format!("{:?}", i.interface_type);
                 let mark = if i.state.is_online() { "●" } else { "○" };
                 Line::from(vec![
                     Span::styled(
-                        format!("{mark} {:<10}", i.name),
+                        format!("{mark} {:<8}", i.name),
                         Style::default().fg(Color::Cyan),
                     ),
+                    Span::raw(format!(" {:<12}", iftype)),
                     Span::raw(format!(" {:<14}", state)),
                     Span::raw(format!(" {:<20}", ip)),
-                    Span::raw(sec.to_string()),
+                    Span::raw(format!(
+                        " {:<22}",
+                        i.ipv6_addrs
+                            .first()
+                            .map(|a| a.to_string())
+                            .unwrap_or_else(|| "-".into())
+                    )),
                 ])
             })
             .collect()
@@ -93,6 +102,30 @@ impl App {
                     Span::raw(format!(" {:<8}", security)),
                     Span::raw(format!(" {:<18}", bssid)),
                     Span::raw(format!(" {}", state)),
+                ])
+            })
+            .collect()
+    }
+
+    /// Render Wi-Fi scan results (signal strength, security, channel).
+    fn scan_lines(&self) -> Vec<Line<'static>> {
+        if self.scan_results.is_empty() {
+            return vec![Line::from("(no scan results — press s to scan)")];
+        }
+        self.scan_results
+            .iter()
+            .map(|r| {
+                let signal = format!("{:>4} dBm", r.signal);
+                let channel = format!("{:>2}", r.channel());
+                Line::from(vec![
+                    Span::styled(
+                        format!("{:<28}", r.ssid),
+                        Style::default().fg(Color::Green),
+                    ),
+                    Span::raw(format!(" {:<8}", r.security.to_string())),
+                    Span::raw(format!(" ch {:<3}", channel)),
+                    Span::raw(format!(" {}", signal)),
+                    Span::raw(format!(" {:>18}", r.bssid.to_string())),
                 ])
             })
             .collect()
@@ -131,6 +164,14 @@ impl Widget for &App {
                 )
                 .highlight_style(Style::default().bg(Color::DarkGray))
                 .highlight_symbol("> "),
+            View::ScanResults => List::new(self.scan_lines())
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Wi-Fi Scan Results"),
+                )
+                .highlight_style(Style::default().bg(Color::DarkGray))
+                .highlight_symbol("> "),
             View::Networks => List::new(self.network_lines())
                 .block(
                     Block::default()
@@ -144,7 +185,7 @@ impl Widget for &App {
 
         // Footer: a hint line inside the scan-results panel.
         let footer = Line::from(vec![
-            Span::raw(" q=quit  i=interfaces  n=networks  "),
+            Span::raw(" q=quit  i=interfaces  w=wifi  n=networks  r=refresh  "),
             Span::styled("s=scan  c=connect", Style::default().fg(Color::Cyan)),
         ]);
         Paragraph::new(footer)
@@ -191,6 +232,19 @@ mod tests {
                 .spans
                 .iter()
                 .any(|s| s.content == "(no known networks)")
+        );
+    }
+
+    #[test]
+    fn scan_lines_empty_state() {
+        let app = App::default();
+        let lines = app.scan_lines();
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .any(|s| s.content.contains("no scan results"))
         );
     }
 }
