@@ -22,8 +22,9 @@ use crossterm::terminal::{
     enable_raw_mode,
 };
 use libnetwork_daemon::{
-    DaemonCommand, DaemonResponse, InterfaceManagerAction, InterfaceResponse,
-    MacAddr, Modification, PrefixedIpv4Addr, ScanResult, Security, WpaState,
+    ConnectionState, DaemonCommand, DaemonResponse, InterfaceManagerAction,
+    InterfaceResponse, MacAddr, Modification, PrefixedIpv4Addr, ScanResult,
+    Security, WpaState,
 };
 use ratatui::Terminal;
 
@@ -42,7 +43,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         ));
 
     let mut client = match DaemonClient::connect(&socket) {
-        Ok(c) => c,
+        Ok(c) => {
+            // If the daemon stalls, don't freeze the TUI forever.
+            c.set_read_timeout(std::time::Duration::from_secs(5));
+            c
+        }
         Err(e) => {
             use client::ClientError;
             let hint = match &e {
@@ -330,16 +335,43 @@ fn enter_interface(app: &mut App, client: &mut DaemonClient) {
         refresh_wifi(client, app);
         return;
     }
-    let up = iface.state.is_up();
-    let action = InterfaceManagerAction::ModLink {
-        name: iface.name.clone(),
-        ipv4: Modification::NoChange,
-        ipv6: Modification::NoChange,
-        oper_state: Modification::Replace(!up),
-        slaac: Modification::NoChange,
-    };
-    send_interface_action(client, action);
-    refresh_interfaces(client, app);
+    match toggle_decision(&iface) {
+        None => {
+            app.status = "回环接口，无需连接/断开".into();
+            app.error = None;
+        }
+        Some((verb, bring_up)) => {
+            app.status = format!("正在{verb} {}…", iface.name);
+            app.error = None;
+            let action = InterfaceManagerAction::ModLink {
+                name: iface.name.clone(),
+                ipv4: Modification::NoChange,
+                ipv6: Modification::NoChange,
+                oper_state: Modification::Replace(bring_up),
+                slaac: Modification::NoChange,
+            };
+            send_interface_action(client, action);
+            refresh_interfaces(client, app);
+        }
+    }
+}
+
+/// Decide the Enter action for an interface. `None` = no toggle (loopback).
+/// Otherwise `(verb, bring_up)` where `bring_up` is the desired link state.
+fn toggle_decision(
+    iface: &libnetwork_daemon::InterfaceInfo,
+) -> Option<(&'static str, bool)> {
+    if iface.interface_type == libnetwork_daemon::InterfaceType::Loopback {
+        return None;
+    }
+    // Treat "connected" as an active link + connection. A Disconnected (link
+    // up but no lease) or down interface should be brought up to connect.
+    let connected = matches!(
+        iface.state,
+        ConnectionState::Connected | ConnectionState::Up
+    );
+    let verb = if connected { "断开" } else { "连接" };
+    Some((verb, !connected))
 }
 
 /// Open the interface-edit modal for the selected interface.
@@ -709,5 +741,48 @@ fn refresh_interfaces(client: &mut DaemonClient, app: &mut App) {
         action: InterfaceManagerAction::GetAllInterfaces,
     }) {
         app.interfaces = list;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use libnetwork_daemon::{ConnectionState, InterfaceInfo, InterfaceType};
+
+    fn iface(
+        name: &str,
+        t: InterfaceType,
+        state: ConnectionState,
+    ) -> InterfaceInfo {
+        let mut i = InterfaceInfo::new(1, name);
+        i.interface_type = t;
+        i.state = state;
+        i
+    }
+
+    #[test]
+    fn toggle_decision_connected_brings_down() {
+        let i =
+            iface("eth0", InterfaceType::Ethernet, ConnectionState::Connected);
+        let d = toggle_decision(&i);
+        assert_eq!(d, Some(("断开", false)));
+    }
+
+    #[test]
+    fn toggle_decision_disconnected_brings_up() {
+        let i = iface(
+            "eth0",
+            InterfaceType::Ethernet,
+            ConnectionState::Disconnected,
+        );
+        let d = toggle_decision(&i);
+        assert_eq!(d, Some(("连接", true)));
+    }
+
+    #[test]
+    fn toggle_decision_loopback_is_none() {
+        let i =
+            iface("lo0", InterfaceType::Loopback, ConnectionState::Connected);
+        assert_eq!(toggle_decision(&i), None);
     }
 }

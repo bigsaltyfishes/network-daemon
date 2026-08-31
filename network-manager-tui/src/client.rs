@@ -89,6 +89,12 @@ impl DaemonClient {
             .map_err(|e| ClientError::Parse(e.to_string()))
     }
 
+    /// Set a read timeout on the underlying socket so a stuck daemon request
+    /// cannot block the TUI forever.
+    pub fn set_read_timeout(&self, d: std::time::Duration) {
+        let _ = self.stream.set_read_timeout(Some(d));
+    }
+
     /// Read the next pushed event line.
     #[allow(dead_code)] // used by the event-subscription UI
     pub fn read_event(&mut self) -> Result<DaemonResponse, ClientError> {
