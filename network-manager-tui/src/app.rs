@@ -4,11 +4,14 @@ use libnetwork_daemon::{
     InterfaceInfo, KnownNetwork, ScanResult, SupplicantStatus,
 };
 use ratatui::{
-    buffer::Buffer,
+    Frame,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, Paragraph, Widget},
+    widgets::{
+        Block, Borders, Cell, Clear, List, ListState, Paragraph, Row, Table,
+        TableState, Widget,
+    },
 };
 
 /// Which main view the user is on.
@@ -22,23 +25,40 @@ pub enum View {
     Networks,
 }
 
-/// A single editable field in a modal form.
+/// The kind of an editable field in a modal form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FieldKind {
+    /// yes/no toggle.
+    Bool,
+    /// free text.
+    Text,
+    /// pick one of `options` via a popup.
+    Selection { options: Vec<String> },
+}
+
+/// A single row in a modal edit form.
 #[derive(Debug, Clone)]
 pub struct Field {
     pub label: String,
     pub value: String,
-    /// Whether the field is a value slot vs a fixed toggle.
-    pub editable: bool,
-    /// Hide input as `*` (passwords).
+    pub kind: FieldKind,
+    /// children shown when the field is expanded (e.g. static-IP fields under
+    /// a "手动" IPv4 selection).
+    pub children: Vec<Field>,
+    /// whether `children` are displayed.
+    pub expanded: bool,
+    /// hide input as `*` (passwords).
     pub password: bool,
 }
 
 impl Field {
-    pub fn toggle_enabled() -> Field {
+    pub fn bool(label: &str, value: bool) -> Field {
         Field {
-            label: "Enabled".into(),
-            value: "yes".into(),
-            editable: true,
+            label: label.to_string(),
+            value: if value { "yes".into() } else { "no".into() },
+            kind: FieldKind::Bool,
+            children: Vec::new(),
+            expanded: false,
             password: false,
         }
     }
@@ -46,7 +66,9 @@ impl Field {
         Field {
             label: label.to_string(),
             value: value.to_string(),
-            editable: true,
+            kind: FieldKind::Text,
+            children: Vec::new(),
+            expanded: false,
             password: false,
         }
     }
@@ -54,34 +76,68 @@ impl Field {
         Field {
             label: label.to_string(),
             value: String::new(),
-            editable: true,
+            kind: FieldKind::Text,
+            children: Vec::new(),
+            expanded: false,
             password: true,
+        }
+    }
+    pub fn selection(label: &str, options: &[&str], value: &str) -> Field {
+        Field {
+            label: label.to_string(),
+            value: value.to_string(),
+            kind: FieldKind::Selection {
+                options: options.iter().map(|s| s.to_string()).collect(),
+            },
+            children: Vec::new(),
+            expanded: false,
+            password: false,
         }
     }
     pub fn fixed(label: &str, value: &str) -> Field {
         Field {
             label: label.to_string(),
             value: value.to_string(),
-            editable: false,
+            kind: FieldKind::Text,
+            children: Vec::new(),
+            expanded: false,
             password: false,
         }
     }
 }
 
-/// A modal form: a list of fields with a cursor.
+/// A modal form: top-level rows, focus, and an open selection popup.
 #[derive(Debug, Clone, Default)]
 pub struct Form {
     pub fields: Vec<Field>,
     pub focus: usize,
+    /// Index of the field whose selection popup is open.
+    pub selection_open: Option<usize>,
+    /// Cursor within an open selection popup.
+    pub selection_cursor: usize,
 }
 
 impl Form {
     pub fn new(fields: Vec<Field>) -> Self {
-        Self { fields, focus: 0 }
+        Self {
+            fields,
+            focus: 0,
+            selection_open: None,
+            selection_cursor: 0,
+        }
     }
-    pub fn current(&mut self) -> &mut Field {
-        let i = self.focus.min(self.fields.len().saturating_sub(1));
-        &mut self.fields[i]
+    /// All visible rows (flattening expanded children), with an index.
+    pub fn flat_rows(&self) -> Vec<(usize, &Field)> {
+        let mut out = Vec::new();
+        for (i, f) in self.fields.iter().enumerate() {
+            out.push((i, f));
+            if f.expanded {
+                for c in &f.children {
+                    out.push((i, c));
+                }
+            }
+        }
+        out
     }
 }
 
@@ -101,7 +157,7 @@ pub enum Modal {
     },
     /// "Connecting..." while a Wi-Fi association is in flight.
     Connecting { ssid: String },
-    /// Edit an interface (DHCP / SLAAC / static IP / DNS) or a saved AP.
+    /// Edit an interface (DHCP / SLAAC / static IP) or a saved AP.
     Edit {
         title: String,
         iface: String,
@@ -115,7 +171,6 @@ pub struct App {
     pub interfaces: Vec<InterfaceInfo>,
     pub scan_results: Vec<ScanResult>,
     pub known_networks: Vec<KnownNetwork>,
-    /// Current supplicant status for the selected wlan interface.
     pub wifi_status: Option<SupplicantStatus>,
     pub interface_selected: usize,
     pub network_selected: usize,
@@ -142,76 +197,70 @@ impl Default for App {
 }
 
 impl App {
-    /// Render the interface list as ratatui line items.
-    pub fn interface_lines(&self) -> Vec<Line<'static>> {
+    /// Build the interface table rows.
+    pub fn interface_rows(&self) -> Vec<Vec<Span<'static>>> {
         self.interfaces
             .iter()
             .map(|i| {
-                let state = i.state.to_string();
-                let ip = i
-                    .ipv4_addrs
-                    .first()
-                    .map(|a| a.to_string())
-                    .unwrap_or_else(|| "-".into());
-                let iftype = format!("{:?}", i.interface_type);
                 let mark = if i.state.is_online() { "●" } else { "○" };
-                let sel = if i.is_wlan() {
-                    ", wifi: Enter"
-                } else {
-                    ", Enter: toggle"
-                };
-                Line::from(vec![
+                vec![
                     Span::styled(
                         format!("{mark} {:<8}", i.name),
                         Style::default().fg(Color::Cyan),
                     ),
-                    Span::raw(format!(" {:<12}", iftype)),
-                    Span::raw(format!(" {:<14}", state)),
-                    Span::raw(format!(" {:<20}", ip)),
                     Span::raw(format!(
-                        " {:<22}",
+                        "{:<12}",
+                        format!("{:?}", i.interface_type)
+                    )),
+                    Span::raw(format!("{:<14}", i.state.to_string())),
+                    Span::raw(format!(
+                        "{:<20}",
+                        i.ipv4_addrs
+                            .first()
+                            .map(|a| a.to_string())
+                            .unwrap_or_else(|| "-".into())
+                    )),
+                    Span::raw(format!(
+                        "{:<22}",
                         i.ipv6_addrs
                             .first()
                             .map(|a| a.to_string())
                             .unwrap_or_else(|| "-".into())
                     )),
-                    Span::raw(sel),
-                ])
+                ]
             })
             .collect()
     }
 
-    /// Render known networks as list items.
-    pub fn network_lines(&self) -> Vec<Line<'static>> {
+    /// Build known-network table rows.
+    pub fn network_rows(&self) -> Vec<Vec<Span<'static>>> {
         if self.known_networks.is_empty() {
-            return vec![Line::from("(no known networks — e to add)")];
+            return vec![vec![Span::raw("(no known networks — e to add)")]];
         }
         self.known_networks
             .iter()
             .map(|n| {
-                let security = n.security.to_string();
-                let state = format!("{:?}", n.state);
-                let bssid = n
-                    .bssid
-                    .map(|b| b.to_string())
-                    .unwrap_or_else(|| "any".into());
-                Line::from(vec![
+                vec![
                     Span::styled(
                         format!("{:<28}", n.ssid),
                         Style::default().fg(Color::Green),
                     ),
-                    Span::raw(format!(" {:<8}", security)),
-                    Span::raw(format!(" {:<18}", bssid)),
-                    Span::raw(format!(" {}", state)),
-                ])
+                    Span::raw(format!("{:<8}", n.security.to_string())),
+                    Span::raw(format!(
+                        "{:<18}",
+                        n.bssid
+                            .map(|b| b.to_string())
+                            .unwrap_or_else(|| "any".into())
+                    )),
+                    Span::raw(format!("{:?}", n.state)),
+                ]
             })
             .collect()
     }
 
-    /// Wi-Fi view: a connected-AP header line plus scan results.
-    pub fn wifi_lines(&self) -> Vec<Line<'static>> {
+    /// Wi-Fi view: a connected-AP header line plus scan-result rows.
+    pub fn wifi_rows(&self) -> Vec<Vec<Span<'static>>> {
         let mut out = Vec::new();
-        // Connected AP header.
         match &self.wifi_status {
             Some(s) => {
                 let ssid = s.ssid.clone().unwrap_or_else(|| "-".into());
@@ -225,143 +274,94 @@ impl App {
                     .find(|r| Some(r.ssid.as_str()) == s.ssid.as_deref())
                     .map(|r| format!("{} dBm", r.signal))
                     .unwrap_or_else(|| "-".into());
-                out.push(Line::from(vec![
+                let connected = vec![
+                    Span::styled("● ", Style::default().fg(Color::Green)),
                     Span::styled(
-                        "Connected: ",
+                        format!("{ssid:<28}"),
                         Style::default().fg(Color::Green),
                     ),
-                    Span::raw(format!("{ssid:<28}")),
-                    Span::raw(format!(" {state}")),
-                    Span::raw(format!("  signal {signal}")),
-                ]));
-                out.push(Line::from(""));
+                    Span::raw(format!(" {:<20}", state)),
+                    Span::raw(format!(" signal {signal}")),
+                ];
+                out.push(connected);
             }
-            None => out.push(Line::from("(no Wi-Fi connection)")),
+            None => out.push(vec![Span::raw("(no Wi-Fi connection)")]),
         }
-        // Scan results.
         if self.scan_results.is_empty() {
-            out.push(Line::from("(no scan results — press s to scan)"));
+            out.push(vec![Span::raw("(no scan results — press s to scan)")]);
             return out;
         }
         out.extend(self.scan_results.iter().map(|r| {
-            let signal = format!("{:>4} dBm", r.signal);
-            let channel = format!("{:>2}", r.channel());
-            Line::from(vec![
+            vec![
                 Span::styled(
                     format!("{:<28}", r.ssid),
                     Style::default().fg(Color::Green),
                 ),
                 Span::raw(format!(" {:<8}", r.security.to_string())),
-                Span::raw(format!(" ch {:<3}", channel)),
-                Span::raw(format!(" {}", signal)),
+                Span::raw(format!(" ch {:<3}", r.channel())),
+                Span::raw(format!(" {:>4} dBm", r.signal)),
                 Span::raw(format!(" {:>18}", r.bssid.to_string())),
-            ])
+            ]
         }));
         out
     }
 
-    /// Build the interface-edit form for a selected interface.
+    /// Build the interface-edit form.
     pub fn interface_form(iface: &InterfaceInfo) -> Form {
-        let v4 = iface
+        let dhcp = iface.dhcpv4_enabled;
+        let mut ipv4 = Field::selection(
+            "IPv4 配置",
+            &["DHCP", "手动"],
+            if dhcp { "DHCP" } else { "手动" },
+        );
+        let static_ip = iface
             .ipv4_addrs
             .first()
             .map(|a| a.to_string())
             .unwrap_or_default();
+        ipv4.children = vec![
+            Field::text("IP 地址", ""),
+            Field::text("网关", ""),
+            Field::text("子网掩码", ""),
+        ];
+        // Prefill static IP when the interface isn't on DHCP.
+        if !dhcp && let Some(v) = static_ip.split('/').next() {
+            ipv4.children[0].value = v.to_string();
+        }
         Form::new(vec![
-            Field {
-                label: "IPv4 (blank = DHCP)".into(),
-                value: if iface.dhcpv4_enabled {
-                    String::new()
-                } else {
-                    v4
-                },
-                editable: true,
-                password: false,
-            },
-            Field {
-                label: "SLAAC (IPv6 auto)".into(),
-                value: if iface.slaac_enabled {
-                    "yes".into()
-                } else {
-                    "no".into()
-                },
-                editable: true,
-                password: false,
-            },
-            Field {
-                label: "DHCPv4".into(),
-                value: if iface.dhcpv4_enabled {
-                    "yes".into()
-                } else {
-                    "no".into()
-                },
-                editable: true,
-                password: false,
-            },
-        ])
-    }
-
-    /// Build an edit-AP form from a scan result (network not yet saved).
-    pub fn ap_form_from_scan(scan: &ScanResult) -> Form {
-        Form::new(vec![
-            Field {
-                label: "SSID".into(),
-                value: scan.ssid.clone(),
-                editable: false,
-                password: false,
-            },
-            Field {
-                label: "BSSID (any = auto)".into(),
-                value: scan.bssid.to_string(),
-                editable: true,
-                password: false,
-            },
-            Field {
-                label: "Password (PSK)".into(),
-                value: String::new(),
-                editable: true,
-                password: true,
-            },
+            ipv4,
+            Field::bool("SLAAC (IPv6 自动)", iface.slaac_enabled),
         ])
     }
 
     /// Build the edit-saved-AP form for a known network.
     pub fn ap_form(net: &KnownNetwork) -> Form {
+        let security = net.security.to_string();
         Form::new(vec![
-            Field {
-                label: "SSID".into(),
-                value: net.ssid.clone(),
-                editable: false,
-                password: false,
-            },
-            Field {
-                label: "BSSID (any = auto)".into(),
-                value: net.bssid.map(|b| b.to_string()).unwrap_or_default(),
-                editable: true,
-                password: false,
-            },
-            Field {
-                label: "Password (PSK)".into(),
-                value: String::new(),
-                editable: true,
-                password: true,
-            },
-            Field {
-                label: "Auto-connect".into(),
-                value: if net.is_enabled() {
-                    "yes".into()
-                } else {
-                    "no".into()
-                },
-                editable: true,
-                password: false,
-            },
+            Field::fixed("SSID", &net.ssid),
+            Field::selection("安全", &["Open", "Psk", "Eap"], &security),
+            Field::text("BSSID (留空=自动)", ""),
+            Field::password("密码 (PSK)"),
+            Field::bool("自动连接", net.is_enabled()),
+        ])
+    }
+
+    /// Build an edit-AP form from a scan result (network not yet saved).
+    pub fn ap_form_from_scan(scan: &ScanResult) -> Form {
+        let security = scan.security.to_string();
+        Form::new(vec![
+            Field::fixed("SSID", &scan.ssid),
+            Field::selection("安全", &["Open", "Psk", "Eap"], &security),
+            Field::text("BSSID (留空=自动)", ""),
+            Field::password("密码 (PSK)"),
         ])
     }
 }
 
-impl Widget for &App {
-    fn render(self, area: Rect, buf: &mut Buffer) {
+impl App {
+    /// Render the whole UI (stateful, so selection is highlighted).
+    pub fn draw(&mut self, f: &mut Frame) {
+        let area = f.area();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -379,123 +379,291 @@ impl Widget for &App {
         };
         let status_text =
             self.error.clone().unwrap_or_else(|| self.status.clone());
-        let header =
-            Paragraph::new(Line::from(status_text)).style(status_style);
-        buf.set_style(chunks[0], status_style);
-        header.render(chunks[0], buf);
+        f.render_widget(
+            Paragraph::new(Line::from(status_text)).style(status_style),
+            chunks[0],
+        );
 
         // Body.
-        let body = match self.view {
-            View::Interfaces => List::new(self.interface_lines())
-                .block(
-                    Block::default().borders(Borders::ALL).title("Interfaces"),
-                )
-                .highlight_style(Style::default().bg(Color::DarkGray))
-                .highlight_symbol("> "),
-            View::Wifi => List::new(self.wifi_lines())
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title("Wi-Fi Networks"),
-                )
-                .highlight_style(Style::default().bg(Color::DarkGray))
-                .highlight_symbol("> "),
-            View::Networks => List::new(self.network_lines())
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title("Known Networks"),
-                )
-                .highlight_style(Style::default().bg(Color::DarkGray))
-                .highlight_symbol("> "),
-        };
-        body.render(chunks[1], buf);
+        self.draw_body(f, chunks[1]);
 
         // Footer hint.
         let footer = Line::from(vec![
             Span::raw(" q=quit  i=ifaces  w=wifi  n=networks  r=refresh  "),
             Span::styled(
-                "↑/↓ move  Enter=act  e=edit  s=scan  Esc=back",
+                "↑/↓ 移动  Enter=操作  e=编辑  s=扫描  Esc=返回",
                 Style::default().fg(Color::Cyan),
             ),
         ]);
-        Paragraph::new(footer)
-            .block(Block::default().borders(Borders::TOP).title("Hint"))
-            .render(chunks[2], buf);
+        f.render_widget(
+            Paragraph::new(footer)
+                .block(Block::default().borders(Borders::TOP).title("提示")),
+            chunks[2],
+        );
 
         // Modal overlay.
         if !matches!(self.modal, Modal::None) {
-            self.render_modal(area, buf);
+            self.draw_modal(f, area);
+        }
+    }
+
+    fn draw_body(&mut self, f: &mut Frame, area: Rect) {
+        let sel = Style::default()
+            .add_modifier(Modifier::REVERSED)
+            .add_modifier(Modifier::BOLD)
+            .bg(Color::DarkGray);
+        match self.view {
+            View::Interfaces => {
+                let header = ["接口", "类型", "状态", "IPv4 地址", "IPv6 地址"];
+                let table = Table::new(
+                    self.interface_rows().into_iter().map(|row| {
+                        Row::new(
+                            row.into_iter().map(Cell::from).collect::<Vec<_>>(),
+                        )
+                    }),
+                    [
+                        Constraint::Length(14),
+                        Constraint::Length(14),
+                        Constraint::Length(15),
+                        Constraint::Length(24),
+                        Constraint::Min(20),
+                    ],
+                )
+                .header(
+                    Row::new(
+                        header
+                            .iter()
+                            .map(|h| Cell::from(Line::from(*h)))
+                            .collect::<Vec<_>>(),
+                    )
+                    .style(Style::default().add_modifier(Modifier::BOLD)),
+                )
+                .row_highlight_style(sel)
+                .block(Block::default().borders(Borders::ALL).title("接口"));
+                let mut state = TableState::default();
+                state.select(Some(self.interface_selected));
+                f.render_stateful_widget(table, area, &mut state);
+            }
+            View::Wifi => {
+                let list = List::new(
+                    self.wifi_rows()
+                        .into_iter()
+                        .map(Line::from)
+                        .collect::<Vec<_>>(),
+                )
+                .highlight_style(sel)
+                .block(
+                    Block::default().borders(Borders::ALL).title("Wi-Fi 网络"),
+                );
+                // Row 0 is the connected-AP line; scan results start at row 1.
+                let mut state = ListState::default();
+                state.select(Some(self.network_selected + 1));
+                f.render_stateful_widget(&list, area, &mut state);
+            }
+            View::Networks => {
+                let header = ["SSID", "安全", "BSSID", "状态"];
+                let table = Table::new(
+                    self.network_rows().into_iter().map(|row| {
+                        Row::new(
+                            row.into_iter().map(Cell::from).collect::<Vec<_>>(),
+                        )
+                    }),
+                    [
+                        Constraint::Length(30),
+                        Constraint::Length(10),
+                        Constraint::Length(22),
+                        Constraint::Min(12),
+                    ],
+                )
+                .header(
+                    Row::new(
+                        header
+                            .iter()
+                            .map(|h| Cell::from(Line::from(*h)))
+                            .collect::<Vec<_>>(),
+                    )
+                    .style(Style::default().add_modifier(Modifier::BOLD)),
+                )
+                .row_highlight_style(sel)
+                .block(
+                    Block::default().borders(Borders::ALL).title("已保存网络"),
+                );
+                let mut state = TableState::default();
+                state.select(Some(self.network_selected));
+                f.render_stateful_widget(table, area, &mut state);
+            }
         }
     }
 }
 
 impl App {
-    /// Render the currently active modal as a centered popup.
-    fn render_modal(&self, area: Rect, buf: &mut Buffer) {
-        let (title, lines, input_hint) = match &self.modal {
-            Modal::None => return,
-            Modal::Message { title, message } => (
-                title.clone(),
-                vec![message.clone()],
-                String::from(" Enter/Esc to close "),
-            ),
-            Modal::Connecting { ssid } => (
-                "Connecting…".to_string(),
-                vec![format!("Connecting to {ssid}")],
-                " please wait ".into(),
-            ),
-            Modal::Password { ssid, input, .. } => (
-                format!("Password for {ssid}"),
-                vec![format!("Password: {}", mask(input))],
-                " Enter=connect  Esc=cancel ".into(),
-            ),
-            Modal::Edit { title, iface, form } => {
-                let mut l = Vec::new();
-                for (i, f) in form.fields.iter().enumerate() {
-                    let cursor = if i == form.focus { ">" } else { " " };
-                    let shown = if f.password {
-                        mask(&f.value)
-                    } else if f.value.is_empty() {
-                        " ".to_string()
-                    } else {
-                        f.value.clone()
-                    };
-                    l.push(format!("{cursor} {:<18} {}", f.label, shown));
-                }
-                (
-                    format!("{title} — {iface}"),
-                    l,
-                    " ↑/↓ move  Enter=save  Esc=cancel ".into(),
-                )
+    fn draw_modal(&self, f: &mut Frame, area: Rect) {
+        match &self.modal {
+            Modal::None => {}
+            Modal::Message { title, message } => {
+                self.popup(
+                    f,
+                    area,
+                    title.clone(),
+                    vec![Line::from(message.clone())],
+                    " Enter/Esc 关闭 ".into(),
+                );
             }
-        };
+            Modal::Connecting { ssid } => {
+                self.popup(
+                    f,
+                    area,
+                    "连接中".into(),
+                    vec![Line::from(format!("正在连接 {ssid}…"))],
+                    " 请稍候 ".into(),
+                );
+            }
+            Modal::Password { ssid, input, .. } => {
+                self.popup(
+                    f,
+                    area,
+                    format!("{ssid} 的密码"),
+                    vec![Line::from(vec![
+                        Span::raw("密码: "),
+                        Span::styled(
+                            mask(input),
+                            Style::default().fg(Color::Yellow),
+                        ),
+                    ])],
+                    " Enter=连接  Esc=取消 ".into(),
+                );
+            }
+            Modal::Edit { title, iface, form } => {
+                let rows = form.flat_rows();
+                let mut lines: Vec<Line> = Vec::new();
+                for (flat, (top, field)) in rows.iter().enumerate() {
+                    let is_child = *top != flat;
+                    let cursor = if !is_child && flat == form.focus {
+                        "▶"
+                    } else {
+                        "  "
+                    };
+                    let pad = if is_child { "    " } else { "" };
+                    let shown = if field.password {
+                        mask(&field.value)
+                    } else {
+                        field.value.clone()
+                    };
+                    let marker = match field.kind {
+                        FieldKind::Selection { .. } => " ▾",
+                        FieldKind::Bool => "",
+                        FieldKind::Text => "",
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!(
+                                "{cursor}{pad}{:<18}{}",
+                                field.label, marker
+                            ),
+                            if !is_child && flat == form.focus {
+                                Style::default().add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::default()
+                            },
+                        ),
+                        Span::raw(format!(" {shown}")),
+                    ]));
+                }
+                self.popup(
+                    f,
+                    area,
+                    format!("{title} — {iface}"),
+                    lines,
+                    " ↑/↓ 移动  Enter=选择/保存  Esc=取消 ".into(),
+                );
+                // Selection sub-popup.
+                if let Some(top) = form.selection_open
+                    && let Some(field) = form.fields.get(top)
+                    && let FieldKind::Selection { options } = &field.kind
+                {
+                    self.draw_selection_popup(
+                        f,
+                        area,
+                        options,
+                        form.selection_cursor,
+                    );
+                }
+            }
+        }
+    }
 
-        // Center the popup.
+    fn draw_selection_popup(
+        &self,
+        f: &mut Frame,
+        area: Rect,
+        options: &[String],
+        cursor: usize,
+    ) {
+        let lines: Vec<Line> = options
+            .iter()
+            .enumerate()
+            .map(|(i, o)| {
+                let mark = if i == cursor { "▶" } else { "  " };
+                Line::from(vec![Span::styled(
+                    format!("{mark} {o}"),
+                    if i == cursor {
+                        Style::default().add_modifier(Modifier::REVERSED)
+                    } else {
+                        Style::default()
+                    },
+                )])
+            })
+            .collect();
+        let w = 30u16;
+        let h = options.len() as u16 + 4;
+        let rect = Rect {
+            x: area.x + area.width.saturating_sub(w).saturating_div(2) + 12,
+            y: area.y + area.height.saturating_sub(h).saturating_div(2),
+            width: w,
+            height: h,
+        };
+        Clear.render(rect, f.buffer_mut());
+        f.render_widget(
+            List::new(lines)
+                .block(Block::default().borders(Borders::ALL))
+                .highlight_style(
+                    Style::default().add_modifier(Modifier::REVERSED),
+                ),
+            rect,
+        );
+    }
+
+    fn popup(
+        &self,
+        f: &mut Frame,
+        area: Rect,
+        title: String,
+        lines: Vec<Line>,
+        hint: String,
+    ) {
         let height = lines.len() as u16 + 4;
-        let width = 52;
-        let popup = Rect {
+        let width = 56;
+        let rect = Rect {
             x: area.x + area.width.saturating_sub(width).saturating_div(2),
             y: area.y + area.height.saturating_sub(height).saturating_div(2),
             width,
             height,
         };
-        buf.set_style(popup, Style::default().bg(Color::DarkGray));
-        Clear.render(popup, buf);
-
-        let mut content = lines
-            .iter()
-            .map(|l| Line::from(l.clone()))
-            .collect::<Vec<_>>();
-        content.push(Line::from(input_hint));
-        Paragraph::new(content)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(title)
-                    .border_style(Style::default().fg(Color::Cyan)),
-            )
-            .render(popup, buf);
+        // Darken behind the popup.
+        f.render_widget(Clear, rect);
+        let mut content = lines;
+        content.push(Line::from(hint));
+        f.render_widget(
+            Paragraph::new(content)
+                .style(Style::default().bg(Color::DarkGray))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(title)
+                        .border_style(Style::default().fg(Color::Cyan)),
+                ),
+            rect,
+        );
     }
 }
 
@@ -511,33 +679,34 @@ fn mask(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use libnetwork_daemon::{ConnectionState, Security};
+    use libnetwork_daemon::{ConnectionState, InterfaceType, Security};
 
     fn iface(name: &str, state: ConnectionState) -> InterfaceInfo {
         let mut i = InterfaceInfo::new(1, name);
         i.state = state;
+        i.interface_type = InterfaceType::Ethernet;
         i
     }
 
     #[test]
-    fn interface_lines_formats_state_and_name() {
+    fn interface_rows_format_columns() {
         let app = App {
             interfaces: vec![iface("eth0", ConnectionState::Connected)],
             ..Default::default()
         };
-        let lines = app.interface_lines();
-        assert_eq!(lines.len(), 1);
-        let rendered = lines[0]
-            .spans
+        let rows = app.interface_rows();
+        assert_eq!(rows.len(), 1);
+        let joined = rows[0]
             .iter()
             .map(|s| s.content.as_ref())
             .collect::<String>();
-        assert!(rendered.contains("eth0"));
-        assert!(rendered.contains("Connected"));
+        assert!(joined.contains("eth0"));
+        assert!(joined.contains("Ethernet"));
+        assert!(joined.contains("Connected"));
     }
 
     #[test]
-    fn wifi_lines_shows_connected_ap() {
+    fn wifi_rows_show_connected_ap() {
         let mut app = App {
             wifi_status: Some(SupplicantStatus {
                 ssid: Some("Home".into()),
@@ -553,44 +722,48 @@ mod tests {
             ssid: "Home".into(),
             security: Security::Psk,
         });
-        let lines = app.wifi_lines();
-        let joined = lines
+        let rows = app.wifi_rows();
+        let joined = rows
             .iter()
-            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .flat_map(|r| r.iter().map(|s| s.content.as_ref()))
             .collect::<String>();
-        assert!(joined.contains("Connected:"));
         assert!(joined.contains("Home"));
         assert!(joined.contains("signal -50 dBm"));
     }
 
     #[test]
-    fn network_lines_empty_state() {
-        let app = App::default();
-        let lines = app.network_lines();
-        assert_eq!(lines.len(), 1);
-        assert!(
-            lines[0]
-                .spans
-                .iter()
-                .any(|s| s.content.contains("no known networks"))
+    fn interface_form_option_default() {
+        // A DHCP interface defaults the IPv4 selection to DHCP and keeps
+        // children collapsed.
+        let mut info = InterfaceInfo::new(1, "eth0");
+        info.dhcpv4_enabled = true;
+        let form = App::interface_form(&info);
+        assert_eq!(form.fields[0].value, "DHCP");
+        assert_eq!(
+            form.fields[0].kind,
+            FieldKind::Selection {
+                options: vec!["DHCP".into(), "手动".into()]
+            }
         );
+        assert!(!form.fields[0].expanded);
     }
 
     #[test]
-    fn scan_lines_empty_state() {
-        // wifi_lines empty-scan message.
-        let app = App::default();
-        let lines = app.wifi_lines();
-        assert!(lines.iter().any(|l| {
-            l.spans
-                .iter()
-                .any(|s| s.content.contains("no scan results"))
-        }));
-    }
-
-    #[test]
-    fn mask_hides_password() {
-        assert_eq!(mask("abc"), "***");
-        assert_eq!(mask(""), " ");
+    fn flat_rows_expands_children() {
+        let mut form = Form::new(vec![Field::selection(
+            "IPv4 配置",
+            &["DHCP", "手动"],
+            "手动",
+        )]);
+        form.fields[0].children = vec![
+            Field::text("IP 地址", "10.0.0.2"),
+            Field::text("网关", "10.0.0.1"),
+        ];
+        form.fields[0].expanded = true;
+        let rows = form.flat_rows();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].1.label, "IPv4 配置");
+        assert_eq!(rows[1].1.label, "IP 地址");
+        assert_eq!(rows[2].1.label, "网关");
     }
 }

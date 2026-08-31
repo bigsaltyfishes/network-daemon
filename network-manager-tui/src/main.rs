@@ -13,7 +13,7 @@ use std::{
     time::Duration,
 };
 
-use app::{App, Form, Modal, View};
+use app::{App, FieldKind, Form, Modal, View};
 use client::DaemonClient;
 use crossterm::ExecutableCommand;
 use crossterm::event::{Event, KeyCode, KeyEventKind, poll, read};
@@ -90,7 +90,7 @@ fn event_loop(
     client: &mut DaemonClient,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
-        terminal.draw(|f| f.render_widget(&*app, f.area()))?;
+        terminal.draw(|f| app.draw(f))?;
 
         if matches!(app.modal, Modal::Connecting { .. }) {
             poll_connection(client, app);
@@ -128,11 +128,13 @@ fn handle_view_key(key: KeyCode, app: &mut App, client: &mut DaemonClient) {
             KeyCode::Enter => enter_interface(app, client),
             KeyCode::Char('r') => refresh_interfaces(client, app),
             KeyCode::Char('e') => edit_interface(app),
+            KeyCode::Char('n') => app.view = View::Networks,
             _ => {}
         },
         View::Wifi => match key {
             KeyCode::Char('q') => std::process::exit(0),
             KeyCode::Char('w') | KeyCode::Esc => app.view = View::Interfaces,
+            KeyCode::Char('n') => app.view = View::Networks,
             KeyCode::Down => {
                 app.network_selected = (app.network_selected + 1)
                     .min(app.scan_results.len().saturating_sub(1));
@@ -184,47 +186,137 @@ fn handle_modal_key(key: KeyCode, app: &mut App, client: &mut DaemonClient) {
             KeyCode::Esc => app.modal = Modal::None,
             _ => {}
         },
-        Modal::Edit { form, .. } => match key {
-            KeyCode::Down => {
-                form.focus =
-                    (form.focus + 1).min(form.fields.len().saturating_sub(1));
+        Modal::Edit { .. } => {
+            // Scope the mutable borrow of the form so we can call
+            // `edit_confirm(app, ..)` after the borrow ends (avoids double
+            // borrow of `app`).
+            let mut save = false;
+            {
+                if let Modal::Edit { form, .. } = &mut app.modal {
+                    if form.selection_open.is_some() {
+                        // A selection popup is open — navigate/confirm options.
+                        match key {
+                            KeyCode::Down => {
+                                let len = form
+                                    .selection_open
+                                    .and_then(|i| form.fields.get(i))
+                                    .and_then(|f| match &f.kind {
+                                        FieldKind::Selection { options } => {
+                                            Some(options.len())
+                                        }
+                                        _ => None,
+                                    })
+                                    .unwrap_or(0);
+                                form.selection_cursor =
+                                    (form.selection_cursor + 1) % len.max(1);
+                            }
+                            KeyCode::Up => {
+                                form.selection_cursor =
+                                    form.selection_cursor.saturating_sub(1);
+                            }
+                            KeyCode::Enter => confirm_selection(form),
+                            KeyCode::Esc => form.selection_open = None,
+                            _ => {}
+                        }
+                    } else {
+                        match key {
+                            KeyCode::Down => move_focus(form, 1),
+                            KeyCode::Up => move_focus(form, -1),
+                            KeyCode::Enter => {
+                                let n = form.flat_rows().len();
+                                if n == 0 {
+                                    return;
+                                }
+                                let flat = form.focus.min(n - 1);
+                                let (top, _) = form.flat_rows()[flat];
+                                match &form.fields[top].kind {
+                                    FieldKind::Selection { .. } => {
+                                        form.selection_open = Some(top);
+                                        form.selection_cursor = 0;
+                                    }
+                                    _ => save = true,
+                                }
+                            }
+                            KeyCode::Backspace => {
+                                edit_field_key(form, KeyCode::Backspace)
+                            }
+                            KeyCode::Char(c) => {
+                                edit_field_key(form, KeyCode::Char(c))
+                            }
+                            KeyCode::Esc => app.modal = Modal::None,
+                            _ => {}
+                        }
+                    }
+                }
             }
-            KeyCode::Up => {
-                form.focus = form.focus.saturating_sub(1);
+            if save {
+                edit_confirm(app, client);
             }
-            KeyCode::Char(' ') => toggle_field(form),
-            KeyCode::Char('y') => set_toggle(form, true),
-            KeyCode::Char('n') => set_toggle(form, false),
-            KeyCode::Backspace => {
-                form.current().value.pop();
-            }
-            KeyCode::Char(c) => form.current().value.push(c),
-            KeyCode::Enter => edit_confirm(app, client),
-            KeyCode::Esc => app.modal = Modal::None,
-            _ => {}
-        },
+        }
         Modal::None => {}
     }
 }
 
-fn toggle_field(form: &mut Form) {
-    let f = form.current();
-    if f.value == "yes" {
-        f.value = "no".into();
-    } else if f.value == "no" {
-        f.value = "yes".into();
-    } else if !f.password {
-        f.value.push(' ');
+/// Move the edit-menu focus across visible (flat) rows.
+fn move_focus(form: &mut Form, delta: isize) {
+    let n = form.flat_rows().len();
+    if n == 0 {
+        return;
+    }
+    let cur = form.focus as isize;
+    let next = (cur + delta).clamp(0, n as isize - 1);
+    form.focus = next as usize;
+}
+
+/// Edit the focused field for a non-Enter key.
+fn edit_field_key(form: &mut Form, key: KeyCode) {
+    let n = form.flat_rows().len();
+    if n == 0 {
+        return;
+    }
+    let flat = form.focus.min(n - 1);
+    let (top, _) = form.flat_rows()[flat];
+    let field = &mut form.fields[top];
+    match &field.kind {
+        FieldKind::Selection { .. } => {
+            // Selection fields are changed via the popup; ignore text keys.
+        }
+        FieldKind::Bool => match key {
+            KeyCode::Char('y') | KeyCode::Char(' ') => {
+                field.value = if field.value == "yes" {
+                    "no".into()
+                } else {
+                    "yes".into()
+                };
+            }
+            _ => {}
+        },
+        FieldKind::Text => match key {
+            KeyCode::Char(c) => field.value.push(c),
+            KeyCode::Backspace => {
+                field.value.pop();
+            }
+            _ => {}
+        },
     }
 }
 
-fn set_toggle(form: &mut Form, value: bool) {
-    let f = form.current();
-    if f.value == "yes" || f.value == "no" {
-        f.value = if value { "yes".into() } else { "no".into() };
-    } else if !f.password {
-        f.value.push(if value { 'y' } else { 'n' });
+/// Confirm a selection-popup choice.
+fn confirm_selection(form: &mut Form) {
+    let Some(top) = form.selection_open else {
+        return;
+    };
+    let Some(field) = form.fields.get_mut(top) else {
+        return;
+    };
+    if let FieldKind::Selection { options } = &field.kind
+        && let Some(chosen) = options.get(form.selection_cursor)
+    {
+        field.value = chosen.clone();
+        // Expand child config fields when "手动" (first non-DHCP option).
+        field.expanded = chosen != "DHCP" && !field.children.is_empty();
     }
+    form.selection_open = None;
 }
 
 /// Pressing Enter on an interface: go into Wi-Fi for wlan, else toggle up/down.
