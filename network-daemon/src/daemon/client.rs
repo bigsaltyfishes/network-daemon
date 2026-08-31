@@ -25,13 +25,12 @@ use crate::{
     wifi::{WifiManager, WifiManagerBackend},
 };
 
-static ESTABLISHED: std::sync::LazyLock<String> = std::sync::LazyLock::new(
-    || {
+static ESTABLISHED: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
         ensure!(serde_json::to_string(&DaemonResponse::Global {
             response: GlobalDaemonResponse::Established
         }))
-    },
-);
+    });
 
 #[derive(Actor)]
 pub struct StreamWriter {
