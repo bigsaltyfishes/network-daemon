@@ -13,14 +13,16 @@ use kameo::{
 use lazy_static::lazy_static;
 use libnetwork_daemon::{
     DaemonCommand, DaemonResponse, GlobalDaemonAction, GlobalDaemonResponse,
-    InterfaceManagerAction, InterfaceResponse, WiFiManagerAction,
+    InterfaceManagerAction, InterfaceResponse, Security, WiFiManagerAction,
     WiFiManagerResponse, ensure, error::NetworkDaemonError, ignore,
 };
 use tracing::error;
 
 use crate::{
+    config::{DaemonConfig, NetworkConfig},
     daemon::subscriber::Subscriber,
     interface::InterfaceManager,
+    storage::{Credential, StorageCommand, StorageManager},
     wifi::{WifiManager, WifiManagerBackend},
 };
 
@@ -73,6 +75,8 @@ where
     _stream: UnixStream,
     writer: ActorRef<StreamWriter>,
     ifmgr: ActorRef<InterfaceManager>,
+    storage: ActorRef<StorageManager>,
+    config_path: std::path::PathBuf,
     _marker: std::marker::PhantomData<W>,
 }
 
@@ -80,7 +84,12 @@ impl<W> Actor for ClientHandler<W>
 where
     W: WifiManagerBackend,
 {
-    type Args = (UnixStream, ActorRef<InterfaceManager>);
+    type Args = (
+        UnixStream,
+        ActorRef<InterfaceManager>,
+        ActorRef<StorageManager>,
+        std::path::PathBuf,
+    );
     type Error = ();
 
     async fn on_start(
@@ -101,6 +110,8 @@ where
             _stream: args.0,
             writer: writer_actor,
             ifmgr: args.1,
+            storage: args.2,
+            config_path: args.3,
             _marker: std::marker::PhantomData,
         })
     }
@@ -246,6 +257,31 @@ where
                                 }
                             },
                             action => {
+                                // Persist known-network changes before forwarding.
+                                match &action {
+                                    WiFiManagerAction::AddNetwork {
+                                        ssid,
+                                        bssid,
+                                        security,
+                                        password,
+                                        identity,
+                                        hidden,
+                                    } => {
+                                        self.persist_network(
+                                            ssid, bssid, security, password,
+                                            identity, hidden,
+                                        )
+                                        .await;
+                                    }
+                                    WiFiManagerAction::RemoveNetwork {
+                                        ssid,
+                                        bssid,
+                                    } => {
+                                        self.remove_persisted(ssid, bssid)
+                                            .await;
+                                    }
+                                    _ => {}
+                                }
                                 match wifi_mgr.ask(action).await {
                                     Ok(ret) => {
                                         // Wait for response
@@ -415,6 +451,75 @@ where
                 tracing::info!("Established connection with new client");
                 self.writer.tell(ESTABLISHED.clone()).await.unwrap();
             }
+        }
+    }
+}
+
+impl<W> ClientHandler<W>
+where
+    W: WifiManagerBackend,
+{
+    /// Persist a known network: metadata to config.toml, credential to SQLite.
+    async fn persist_network(
+        &self,
+        ssid: &str,
+        bssid: &Option<libnetwork_daemon::MacAddr>,
+        security: &Security,
+        password: &Option<String>,
+        identity: &Option<String>,
+        hidden: &bool,
+    ) {
+        // Sensitive credential → SQLite (encrypted at rest).
+        let cred = Credential {
+            ssid: ssid.to_string(),
+            bssid: bssid.map(|m| m.to_string()),
+            security: security.to_string(),
+            psk: password.clone(),
+            identity: identity.clone(),
+        };
+        if let Err(e) =
+            self.storage.ask(StorageCommand::SaveCredential(cred)).await
+        {
+            error!("failed to persist credential: {:?}", e);
+        }
+
+        // Metadata → config.toml (non-sensitive).
+        let mut cfg = DaemonConfig::load(&self.config_path).unwrap_or_default();
+        cfg.upsert_network(NetworkConfig {
+            ssid: ssid.to_string(),
+            bssid: bssid.map(|m| m.to_string()),
+            security: security.to_string(),
+            hidden: *hidden,
+            priority: 0,
+            enabled: true,
+        });
+        if let Err(e) = cfg.save(&self.config_path) {
+            error!("failed to save config: {}", e);
+        }
+    }
+
+    /// Remove a persisted known network (SQLite + config.toml).
+    async fn remove_persisted(
+        &self,
+        ssid: &str,
+        bssid: &Option<libnetwork_daemon::MacAddr>,
+    ) {
+        let b = bssid.map(|m| m.to_string());
+        if let Err(e) = self
+            .storage
+            .ask(StorageCommand::RemoveCredential {
+                ssid: ssid.to_string(),
+                bssid: b.clone(),
+            })
+            .await
+        {
+            error!("failed to remove credential: {:?}", e);
+        }
+
+        let mut cfg = DaemonConfig::load(&self.config_path).unwrap_or_default();
+        cfg.remove_network(ssid, b.as_deref());
+        if let Err(e) = cfg.save(&self.config_path) {
+            error!("failed to save config: {}", e);
         }
     }
 }

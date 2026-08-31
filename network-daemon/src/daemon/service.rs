@@ -20,6 +20,7 @@ use crate::{
     dhcp::DhcpManager,
     interface::InterfaceManager,
     route::RouteManager,
+    storage::{StorageManager, StoragePaths},
     wifi::{WifiManager, WifiManagerBackend},
 };
 
@@ -35,6 +36,10 @@ where
     wifi_supervisors: HashMap<String, ActorRef<WifiManager<W>>>,
     /// Active Dhcp Supervisors
     dhcp_supervisors: HashMap<String, ActorRef<DhcpManager>>,
+    /// Credential store (SQLite, encrypted at rest)
+    storage: ActorRef<StorageManager>,
+    /// Path to the user-editable config.toml (non-sensitive settings).
+    config_path: PathBuf,
     /// Flock Handle
     _pid_lock: Flock<File>,
     /// Phantom Data
@@ -155,11 +160,33 @@ where
 
         info!("NetworkDaemon started, listening on {:?}", socket_path);
 
+        // Start the credential storage manager (SQLite + encrypted secrets).
+        // Config dir keeps credentials apart from the runtime socket dir.
+        let config_dir = PathBuf::from("/var/db/network-daemon");
+        let storage_paths = StoragePaths {
+            runtime_dir: args.clone(),
+            config_dir,
+        };
+        let storage =
+            StorageManager::new(&storage_paths).await.map_err(|e| {
+                error!("Failed to open credential store: {}", e);
+                NetworkDaemonError::InvalidParameter(
+                    "Failed to open credential store".to_string(),
+                )
+            })?;
+        let storage =
+            StorageManager::spawn_with_mailbox(storage, mailbox::unbounded());
+        actor_ref.link(&storage).await;
+
+        info!("NetworkDaemon started, listening on {:?}", socket_path);
+
         Ok(Self {
             working_dir: args,
             ifmgr,
             wifi_supervisors: HashMap::new(),
             dhcp_supervisors: HashMap::new(),
+            storage,
+            config_path: PathBuf::from("/var/db/network-daemon/config.toml"),
             _pid_lock: pid_lock,
             _phantom: std::marker::PhantomData,
         })
@@ -239,7 +266,12 @@ where
             StreamMessage::Next(Ok(stream)) => {
                 info!("New client connected");
                 ClientHandler::<W>::spawn_with_mailbox(
-                    (stream, self.ifmgr.clone()),
+                    (
+                        stream,
+                        self.ifmgr.clone(),
+                        self.storage.clone(),
+                        self.config_path.clone(),
+                    ),
                     mailbox::unbounded(),
                 );
             }
