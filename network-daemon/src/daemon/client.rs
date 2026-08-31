@@ -10,7 +10,6 @@ use kameo::{
     message::StreamMessage,
     prelude::{Context, Message},
 };
-use lazy_static::lazy_static;
 use libnetwork_daemon::{
     DaemonCommand, DaemonResponse, GlobalDaemonAction, GlobalDaemonResponse,
     InterfaceManagerAction, InterfaceResponse, Security, WiFiManagerAction,
@@ -26,12 +25,13 @@ use crate::{
     wifi::{WifiManager, WifiManagerBackend},
 };
 
-lazy_static! {
-    static ref ESTABLISHED: String =
+static ESTABLISHED: std::sync::LazyLock<String> = std::sync::LazyLock::new(
+    || {
         ensure!(serde_json::to_string(&DaemonResponse::Global {
             response: GlobalDaemonResponse::Established
-        }));
-}
+        }))
+    },
+);
 
 #[derive(Actor)]
 pub struct StreamWriter {

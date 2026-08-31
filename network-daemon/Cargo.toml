@@ -7,9 +7,7 @@ edition = "2024"
 thiserror = "2"
 
 # Async trait support
-async-trait = "0.1"
 libc = "0.2.178"
-lazy_static = "1.5.0"
 libnetwork-daemon = { version = "0.1.0", path = "../libnetwork-daemon" }
 tracing = "0.1.44"
 tracing-subscriber = "0.3.22"
@@ -28,7 +26,6 @@ futures-util = "0.3.31"
 serde = "1.0.228"
 async-net = "2.0.0"
 route_manager = { path = "../vendor/route_manager", features = ["async_io"] }
-reqwest = "0.13.1"
 dhcproto = "0.14.0"
 etherparse = "0.19.0"
 rand = "0.9.2"
