@@ -38,7 +38,18 @@ impl DaemonClient {
         let stream = UnixStream::connect(path).map_err(ClientError::Connect)?;
         let reader =
             BufReader::new(stream.try_clone().map_err(ClientError::Connect)?);
-        Ok(Self { stream, reader })
+        let mut client = Self { stream, reader };
+        // The daemon greets each new connection with an `Established` response.
+        // Consume it so subsequent `request()` calls read the actual reply.
+        let greeting = client.read_line()?;
+        let parsed: DaemonResponse = serde_json::from_str(&greeting)
+            .map_err(|e| ClientError::Parse(e.to_string()))?;
+        if !matches!(parsed, DaemonResponse::Global { .. }) {
+            return Err(ClientError::Daemon(format!(
+                "unexpected greeting: {greeting}"
+            )));
+        }
+        Ok(client)
     }
 
     /// Read one blank-line-terminated JSON response line.
@@ -92,7 +103,7 @@ mod tests {
     use super::*;
     use libnetwork_daemon::{
         DaemonCommand, DaemonResponse, GlobalDaemonResponse,
-        InterfaceManagerAction,
+        InterfaceManagerAction, InterfaceResponse,
     };
     use std::io::Read;
 
@@ -108,6 +119,10 @@ mod tests {
         let listener = UnixListener::bind(&sock).unwrap();
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
+            // Greeting: the daemon sends `Established` on connect.
+            stream
+                .write_all(b"{\"subsystem\":\"Global\",\"response\":\"Established\"}\n")
+                .unwrap();
             let mut buf = [0u8; 512];
             let n = stream.read(&mut buf).unwrap();
             assert!(
@@ -145,10 +160,25 @@ mod tests {
                 action: InterfaceManagerAction::GetAllInterfaces,
             })
             .unwrap();
-        // The daemon responds with a JSON DaemonResponse (possibly an error if
-        // the interface manager is degraded); the wire protocol round-trips.
-        let _ = resp;
-        println!("live_probe OK: daemon returned a valid response");
+        // Assert the daemon actually enumerates interfaces (at least the
+        // loopback / an ethernet device), proving the full client→daemon→
+        // protocol path returns real data.
+        if let DaemonResponse::InterfaceManager {
+            response: InterfaceResponse::InfoList(list),
+        } = resp
+        {
+            assert!(
+                !list.iter().any(|i| i.is_wlan()),
+                "expected at least a loopback/ethernet interface"
+            );
+            println!(
+                "live_probe OK: got {} interfaces: {:?}",
+                list.len(),
+                list.iter().map(|i| i.name.as_str()).collect::<Vec<_>>()
+            );
+        } else {
+            panic!("expected InfoList, got: {resp:?}");
+        }
     }
 
     #[test]
