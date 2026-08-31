@@ -39,3 +39,35 @@ Should work out of box, but we haven't implement local storge system yet, any ch
     - [ ] Wireup all subsystem
     - [x] Handle IPC request
     - [x] Auto create WiFiManager actor
+## TUI Client & the `network` group
+
+The daemon's control socket (`/var/run/network-daemon/network-daemon.sock`) is
+restricted to the `network` group (owned `network:network`, mode `0660`). To use
+the TUI client as a normal user you must be a member of that group:
+
+```sh
+sudo pw groupmod network -m $USER
+# then log out and back in (or reconnect SSH/session) for it to take effect
+```
+
+Build and run the TUI on the FreeBSD host:
+
+```sh
+cargo build -p network-manager-tui
+sudo -u $USER ./target/debug/network-manager-tui
+```
+
+Keys: `i` interfaces · `w` Wi-Fi scan results · `n` known networks ·
+`s` scan · `c` connect · `r` refresh · `q` quit.
+
+If you get `Permission denied`, it means your session doesn't yet have the
+`network` group (re-login) — the daemon is working correctly.
+
+To override the socket path: set `NETWORK_DAEMON_SOCK=/path/to/network-daemon.sock`.
+
+## Building / Artifacts
+
+Dev builds happen inside the lima `freebsd` VM (read-only host mount
+requires `CARGO_TARGET_DIR=$HOME/nd-target`). Built binaries:
+- Daemon: `$HOME/nd-target/debug/network-daemon`
+- TUI: `$HOME/nd-target/debug/network-manager-tui`
