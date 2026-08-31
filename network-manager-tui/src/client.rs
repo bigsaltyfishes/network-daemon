@@ -127,6 +127,30 @@ mod tests {
         let _ = std::fs::remove_file(&sock);
     }
 
+    /// Live probe: connects to the real daemon socket and verifies a response
+    /// JSON line comes back (run with the daemon running, as a network-group
+    /// member or root). Ignored by default; run with:
+    ///   cargo test -p network-manager-tui live_probe -- --ignored
+    #[test]
+    #[ignore]
+    fn live_probe() {
+        let sock = std::path::PathBuf::from(
+            std::env::var("NETWORK_DAEMON_SOCK").unwrap_or_else(|_| {
+                "/var/run/network-daemon/network-daemon.sock".into()
+            }),
+        );
+        let mut client = DaemonClient::connect(&sock).unwrap();
+        let resp = client
+            .request(&DaemonCommand::InterfaceManager {
+                action: InterfaceManagerAction::GetAllInterfaces,
+            })
+            .unwrap();
+        // The daemon responds with a JSON DaemonResponse (possibly an error if
+        // the interface manager is degraded); the wire protocol round-trips.
+        let _ = resp;
+        println!("live_probe OK: daemon returned a valid response");
+    }
+
     #[test]
     fn response_line_is_trimmed() {
         // A helper to parse what read_line feeds to serde_json.

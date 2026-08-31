@@ -75,11 +75,22 @@ impl<T> NetlinkQuery<T> {
                 }
 
                 let recv_packet =
-                    NetlinkMessage::<RouteNetlinkMessage>::deserialize(
+                    match NetlinkMessage::<RouteNetlinkMessage>::deserialize(
                         &recv_buf[offset..],
-                    )
-                    .map_err(|e| NetlinkQueryError::DecodeError(e.into()))?;
-
+                    ) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            // One bad message (e.g. a FreeBSD link attribute
+                            // this crate doesn't model) must not abort the dump.
+                            // Discard the rest of this buffer and read the next
+                            // batch of messages from the kernel.
+                            tracing::warn!(
+                                "netlink decode error, skipping buffer: {}",
+                                e
+                            );
+                            break;
+                        }
+                    };
                 match recv_packet.payload {
                     NetlinkPayload::InnerMessage(msg) => callback(msg),
                     NetlinkPayload::Done(_) => break 'outer,
