@@ -15,7 +15,7 @@ pub use status::{SupplicantStatus, WpaState};
 
 use crate::MacAddr;
 
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub enum WiFiManagerResponse {
     ScanResults(Vec<ScanResult>),
     KnownNetworks(Vec<KnownNetwork>),
@@ -179,7 +179,7 @@ pub enum WiFiManagerAction {
     WpaEvent { event: WpaEvent },
 }
 
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub enum WpaCommand {
     Bss { addr: String },
     Ping,

@@ -2,13 +2,22 @@
 
 use bitflags::bitflags;
 use schemars::JsonSchema;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{MacAddr, utils::unescape_ssid, wifi::Security};
 
 /// Known network state
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Default, Hash, Serialize, JsonSchema,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    Hash,
+    Serialize,
+    Deserialize,
+    JsonSchema,
 )]
 pub enum KnownNetworkState {
     /// Network is enabled for auto-connect
@@ -41,7 +50,7 @@ impl KnownNetworkState {
 }
 
 /// A saved/known network
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct KnownNetwork {
     /// Network ID (wpa_supplicant-assigned). Only present after we add the
     /// network into wpa_supplicant during connect.
@@ -153,6 +162,16 @@ impl Serialize for ScanFlags {
     }
 }
 
+impl<'de> serde::Deserialize<'de> for ScanFlags {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let bits: u32 = serde::Deserialize::deserialize(deserializer)?;
+        Ok(ScanFlags::from_bits_retain(bits))
+    }
+}
+
 impl JsonSchema for ScanFlags {
     fn schema_name() -> std::borrow::Cow<'static, str> {
         std::borrow::Cow::Borrowed("ScanFlags")
@@ -215,7 +234,7 @@ impl ScanFlags {
 }
 
 /// A scan result (available network)
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ScanResult {
     /// Frequency in MHz
     pub freq: i32,

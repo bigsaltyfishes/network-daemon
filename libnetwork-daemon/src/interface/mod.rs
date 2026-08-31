@@ -11,7 +11,7 @@ use crate::{
     Lease, PrefixedIpAddr, PrefixedIpv4Addr, PrefixedIpv6Addr, WlanLinkOptions,
 };
 
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub enum InterfaceResponse {
     Success(()),
     Info(InterfaceInfo),

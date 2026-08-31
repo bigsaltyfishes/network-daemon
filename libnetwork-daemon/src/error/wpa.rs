@@ -1,12 +1,12 @@
 //! WPA Supplicant control interface error types
 
 use schemars::JsonSchema;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{WpaCommand, error::IoError};
 
-#[derive(Debug, Error, Serialize, JsonSchema)]
+#[derive(Debug, Error, Serialize, Deserialize, JsonSchema)]
 pub enum WpaSocketError {
     #[error("Socket creation failed: {0}")]
     SocketCreationFailed(#[source] IoError),
@@ -23,7 +23,7 @@ pub enum WpaSocketError {
 }
 
 /// Errors that can occur when communicating with wpa_supplicant
-#[derive(Error, Debug, Serialize, JsonSchema)]
+#[derive(Error, Debug, Serialize, Deserialize, JsonSchema)]
 pub enum WpaCtrlError {
     /// Failed to send command
     #[error("failed to send command: {cmd:?}")]

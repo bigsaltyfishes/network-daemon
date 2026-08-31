@@ -1,5 +1,5 @@
 use schemars::JsonSchema;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -12,6 +12,16 @@ impl Serialize for IoError {
         S: serde::Serializer,
     {
         serializer.serialize_str(&self.0.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for IoError {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let msg: String = Deserialize::deserialize(deserializer)?;
+        Ok(IoError(std::io::Error::other(msg)))
     }
 }
 

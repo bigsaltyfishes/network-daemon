@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "network-daemon", 
     "libnetwork-daemon",
+    "network-manager-tui",
     "schema-generator"
 ]
 

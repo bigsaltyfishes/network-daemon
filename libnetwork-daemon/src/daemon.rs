@@ -21,7 +21,7 @@ pub enum DaemonCommand {
     },
 }
 
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub enum GlobalDaemonResponse {
     /// Acknowledgment of connection establishment
     Established,
@@ -33,7 +33,7 @@ pub enum GlobalDaemonResponse {
     Error { message: String },
 }
 
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "subsystem")]
 pub enum DaemonResponse {
     InterfaceManager {

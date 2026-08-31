@@ -3,12 +3,12 @@
 use std::ffi::NulError;
 
 use schemars::JsonSchema;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::error::{IoError, netlink::NetlinkQueryError};
 
-#[derive(Error, Debug, Serialize, JsonSchema)]
+#[derive(Error, Debug, Serialize, Deserialize, JsonSchema)]
 pub enum IfconfigError {
     #[error("IO Error: {0}")]
     IoError(#[from] IoError),
@@ -31,7 +31,7 @@ impl From<tokio::task::JoinError> for IfconfigError {
 }
 
 /// Errors that can occur when managing network interfaces
-#[derive(Error, Debug, Serialize, JsonSchema)]
+#[derive(Error, Debug, Serialize, Deserialize, JsonSchema)]
 pub enum InterfaceError {
     /// Failed to query interface info
     #[error("failed to query interface info: {0}")]

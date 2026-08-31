@@ -1,13 +1,13 @@
 //! WiFi operation error types
 
 use schemars::JsonSchema;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{MacAddr, error::WpaCtrlError};
 
 /// Errors that can occur during WiFi operations
-#[derive(Error, Debug, Serialize, JsonSchema)]
+#[derive(Error, Debug, Serialize, Deserialize, JsonSchema)]
 pub enum WifiError {
     /// WPA control error
     #[error("WPA control error")]

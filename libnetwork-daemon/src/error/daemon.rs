@@ -1,10 +1,10 @@
 use schemars::JsonSchema;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::error::{InterfaceError, WifiError, WpaCtrlError};
 
-#[derive(Debug, Error, Serialize, JsonSchema)]
+#[derive(Debug, Error, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "error_type", content = "details")]
 pub enum NetworkDaemonError {
     /// Interface manager error
