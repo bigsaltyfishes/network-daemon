@@ -785,4 +785,68 @@ mod tests {
         assert_eq!(rows[1].1.label, "IP 地址");
         assert_eq!(rows[2].1.label, "网关");
     }
+
+    /// Render helper: draw `app` onto a TestBackend and return the joined
+    /// buffer content plus whether any cell carries the REVERSED highlight.
+    fn render(app: &mut App) -> (String, bool) {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut highlighted = false;
+        let content: String = buffer
+            .content()
+            .iter()
+            .map(|c| {
+                if c.modifier.contains(Modifier::REVERSED) {
+                    highlighted = true;
+                }
+                c.symbol()
+            })
+            .collect::<String>()
+            // Wide CJK graphemes occupy two buffer cells (a padding cell is
+            // blank), so strip whitespace before substring assertions.
+            .replace([' ', '\n'], "");
+        (content, highlighted)
+    }
+
+    #[test]
+    fn interfaces_view_renders_table_header_and_highlight() {
+        let mut app = App {
+            interfaces: vec![
+                iface("eth0", ConnectionState::Connected),
+                iface("lo0", ConnectionState::Disabled),
+            ],
+            interface_selected: 0,
+            ..Default::default()
+        };
+        let (content, highlighted) = render(&mut app);
+        assert!(content.contains("接口"), "missing 接口 column: {content}");
+        assert!(content.contains("类型"), "missing 类型 column: {content}");
+        assert!(content.contains("状态"), "missing 状态 column: {content}");
+        assert!(content.contains("IPv4地址"), "missing IPv4 column: {content}");
+        assert!(content.contains("IPv6地址"), "missing IPv6 column: {content}");
+        assert!(content.contains("eth0"));
+        assert!(content.contains("lo0"));
+        assert!(highlighted, "selected row is not highlighted (REVERSED)");
+    }
+
+    #[test]
+    fn edit_modal_renders_ok_cancel_footer() {
+        let form = App::interface_form(&iface("eth0", ConnectionState::Connected));
+        let mut app = App {
+            interfaces: vec![iface("eth0", ConnectionState::Connected)],
+            modal: Modal::Edit {
+                title: "Edit Interface".into(),
+                iface: "eth0".into(),
+                form,
+            },
+            ..Default::default()
+        };
+        let (content, _) = render(&mut app);
+        assert!(content.contains("IPv4配置"), "IPv4 field missing: {content}");
+        assert!(content.contains("OK"), "OK button missing: {content}");
+        assert!(content.contains("Cancel"), "Cancel button missing: {content}");
+    }
 }
