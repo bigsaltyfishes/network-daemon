@@ -182,23 +182,57 @@ fn handle_modal_key(key: KeyCode, app: &mut App, client: &mut DaemonClient) {
                 app.modal = Modal::None;
             }
         }
-        Modal::Password { input, .. } => match key {
-            KeyCode::Char(c) => input.push(c),
+        Modal::Password { input, footer_sel, .. } => match key {
+            KeyCode::Tab | KeyCode::Right | KeyCode::Left => {
+                *footer_sel = 1 - *footer_sel;
+            }
+            KeyCode::Char(c) => {
+                if *footer_sel == 0 {
+                    input.push(c);
+                } else {
+                    *footer_sel = 0;
+                    input.push(c);
+                }
+            }
             KeyCode::Backspace => {
                 input.pop();
             }
-            KeyCode::Enter => password_confirm(app, client),
+            KeyCode::Enter => {
+                if *footer_sel == 0 {
+                    password_confirm(app, client);
+                } else {
+                    app.modal = Modal::None;
+                }
+            }
             KeyCode::Esc => app.modal = Modal::None,
             _ => {}
         },
         Modal::Edit { .. } => {
-            // Scope the mutable borrow of the form so we can call
+            // Scope the mutable borrow of the form so we can dispatch
             // `edit_confirm(app, ..)` after the borrow ends (avoids double
             // borrow of `app`).
             let mut save = false;
+            let mut discard = false;
             {
                 if let Modal::Edit { form, .. } = &mut app.modal {
-                    if form.selection_open.is_some() {
+                    if form.on_footer {
+                        // OK / Cancel footer focused.
+                        match key {
+                            KeyCode::Tab | KeyCode::Right | KeyCode::Left => {
+                                form.footer_sel = 1 - form.footer_sel;
+                            }
+                            KeyCode::Up => form.on_footer = false,
+                            KeyCode::Enter => {
+                                if form.footer_sel == 0 {
+                                    save = true;
+                                } else {
+                                    discard = true;
+                                }
+                            }
+                            KeyCode::Esc => discard = true,
+                            _ => {}
+                        }
+                    } else if form.selection_open.is_some() {
                         // A selection popup is open — navigate/confirm options.
                         match key {
                             KeyCode::Down => {
@@ -225,6 +259,10 @@ fn handle_modal_key(key: KeyCode, app: &mut App, client: &mut DaemonClient) {
                         }
                     } else {
                         match key {
+                            KeyCode::Tab => {
+                                form.on_footer = true;
+                                form.footer_sel = 0;
+                            }
                             KeyCode::Down => move_focus(form, 1),
                             KeyCode::Up => move_focus(form, -1),
                             KeyCode::Enter => {
@@ -239,7 +277,7 @@ fn handle_modal_key(key: KeyCode, app: &mut App, client: &mut DaemonClient) {
                                         form.selection_open = Some(top);
                                         form.selection_cursor = 0;
                                     }
-                                    _ => save = true,
+                                    _ => form.on_footer = true,
                                 }
                             }
                             KeyCode::Backspace => {
@@ -248,13 +286,15 @@ fn handle_modal_key(key: KeyCode, app: &mut App, client: &mut DaemonClient) {
                             KeyCode::Char(c) => {
                                 edit_field_key(form, KeyCode::Char(c))
                             }
-                            KeyCode::Esc => app.modal = Modal::None,
+                            KeyCode::Esc => discard = true,
                             _ => {}
                         }
                     }
                 }
             }
-            if save {
+            if discard {
+                app.modal = Modal::None;
+            } else if save {
                 edit_confirm(app, client);
             }
         }
@@ -484,6 +524,7 @@ fn wifi_connect(app: &mut App, client: &mut DaemonClient) {
         bssid: Some(scan.bssid.to_string()),
         iface: iface.name,
         input: String::new(),
+        footer_sel: 0,
     };
 }
 
@@ -495,6 +536,7 @@ fn password_confirm(app: &mut App, client: &mut DaemonClient) {
             bssid,
             iface,
             input,
+            ..
         } => (ssid.clone(), bssid.clone(), iface.clone(), input.clone()),
         _ => return,
     };
@@ -655,31 +697,53 @@ fn edit_known_ap(app: &mut App, client: &mut DaemonClient) {
     let _ = client;
 }
 
-/// Submit an edit form (interface or AP).
+/// Submit an edit form (interface or AP). Validates config first; an invalid
+/// config is rejected with an error popup instead of applying.
 fn edit_confirm(app: &mut App, client: &mut DaemonClient) {
     let (title, iface, form) = match std::mem::take(&mut app.modal) {
         Modal::Edit { title, iface, form } => (title, iface, form),
         _ => return,
     };
-    if title.starts_with("Edit Interface") {
-        apply_interface_edit(client, iface, form);
+    let result = if title.starts_with("Edit Interface") {
+        apply_interface_edit(client, iface, form)
     } else {
-        apply_ap_edit(client, iface, form);
+        apply_ap_edit(client, iface, form)
+    };
+    if let Err(msg) = result {
+        app.modal = Modal::Message {
+            title: "配置无效".into(),
+            message: msg,
+        };
+    } else {
+        app.status = "已保存".into();
     }
 }
 
-/// Apply an interface-edit form (DHCP / SLAAC / static IPv4).
-fn apply_interface_edit(client: &mut DaemonClient, iface: String, form: Form) {
-    let v4 = form.fields[0].value.trim().to_string();
+/// Apply an interface-edit form, validating static-IP fields.
+fn apply_interface_edit(
+    client: &mut DaemonClient,
+    iface: String,
+    form: Form,
+) -> Result<(), String> {
     let slaac = form.fields[1].value == "yes";
+    let manual = form.fields[0].value == "手动";
 
-    let ipv4 = if v4.is_empty() {
+    let ipv4 = if !manual {
         Modification::NoChange
     } else {
-        match parse_prefixed_v4(&v4) {
-            Some(p) => Modification::Replace(p),
-            None => Modification::NoChange,
+        // Manual IP config: children are IP / gateway / subnet mask.
+        let ip = form.fields[0].children[0].value.trim().to_string();
+        let _gw = form.fields[0].children[1].value.trim().to_string();
+        let mask = form.fields[0].children[2].value.trim().to_string();
+        if ip.is_empty() {
+            return Err("手动模式必须填写 IP 地址".into());
         }
+        let addr: Ipv4Addr = ip
+            .parse()
+            .map_err(|_| format!("IP 地址无效: {ip}"))?;
+        let prefix = mask_prefix(&mask)
+            .ok_or_else(|| format!("子网掩码无效: {mask}"))?;
+        Modification::Replace(PrefixedIpv4Addr::new(addr, prefix))
     };
 
     let action = InterfaceManagerAction::ModLink {
@@ -690,37 +754,77 @@ fn apply_interface_edit(client: &mut DaemonClient, iface: String, form: Form) {
         slaac: Modification::Replace(slaac),
     };
     send_interface_action(client, action);
+    Ok(())
 }
 
-/// Apply an AP-edit form (BSSID / password / auto-connect).
-fn apply_ap_edit(client: &mut DaemonClient, iface: String, form: Form) {
-    let ssid = form.fields[0].value.clone();
-    let bssid_val = form.fields[1].value.trim().to_string();
-    let pwd = form.fields[2].value.clone();
-    let bssid = MacAddr::parse(&bssid_val);
+/// Apply an AP-edit form, validating SSID / BSSID / password.
+fn apply_ap_edit(
+    client: &mut DaemonClient,
+    iface: String,
+    form: Form,
+) -> Result<(), String> {
+    let ssid = form.fields[0].value.trim().to_string();
+    let security = form.fields[1].value.clone();
+    let bssid_val = form.fields[2].value.trim().to_string();
+    let pwd = form.fields[3].value.clone();
+    if ssid.is_empty() {
+        return Err("SSID 不能为空".into());
+    }
+    let bssid = if bssid_val.is_empty() {
+        None
+    } else {
+        Some(MacAddr::parse(&bssid_val).ok_or_else(|| {
+            format!("BSSID 无效: {bssid_val}（应为 aa:bb:cc:dd:ee:ff）")
+        })?)
+    };
+    // PSK password length and security consistency.
+    let effective_sec = if security == "Psk" {
+        if pwd.is_empty() {
+            return Err("WPA-PSK 必须填写密码（8–63 位）".into());
+        }
+        if pwd.len() < 8 || pwd.len() > 63 {
+            return Err("密码长度必须为 8–63 位".into());
+        }
+        Security::Psk
+    } else if security == "Eap" {
+        if pwd.is_empty() {
+            return Err("企业认证 (EAP) 必须填写凭据".into());
+        }
+        Security::Eap
+    } else {
+        Security::Open
+    };
     let _ = client.request(&DaemonCommand::WiFiManager {
         iface,
         action: libnetwork_daemon::WiFiManagerAction::AddNetwork {
             ssid,
             bssid,
-            security: if pwd.is_empty() {
-                Security::Open
-            } else {
-                Security::Psk
-            },
+            security: effective_sec,
             password: if pwd.is_empty() { None } else { Some(pwd) },
-            identity: None,
+            identity: if effective_sec == Security::Eap {
+                Some("user".into())
+            } else {
+                None
+            },
             hidden: false,
         },
     });
+    Ok(())
 }
 
-/// Parse "a.b.c.d/prefix" into a PrefixedIpv4Addr.
-fn parse_prefixed_v4(s: &str) -> Option<PrefixedIpv4Addr> {
-    let (ip, prefix) = s.split_once('/')?;
-    let addr: Ipv4Addr = ip.parse().ok()?;
-    let prefix: u8 = prefix.parse().ok()?;
-    Some(PrefixedIpv4Addr::new(addr, prefix))
+/// Convert a dotted subnet mask (e.g. "255.255.255.0") to a prefix length.
+fn mask_prefix(mask: &str) -> Option<u8> {
+    let m: Ipv4Addr = mask.parse().ok()?;
+    let bits = u32::from(m);
+    // A valid mask is a run of 1s then 0s.
+    if bits == 0 {
+        return Some(0);
+    }
+    let inv = !bits;
+    if inv & (inv + 1) != 0 {
+        return None;
+    }
+    Some(bits.leading_ones() as u8)
 }
 
 fn send_interface_action(
@@ -784,5 +888,29 @@ mod tests {
         let i =
             iface("lo0", InterfaceType::Loopback, ConnectionState::Connected);
         assert_eq!(toggle_decision(&i), None);
+    }
+
+    #[test]
+    fn mask_prefix_parses_valid_masks() {
+        assert_eq!(mask_prefix("0.0.0.0"), Some(0));
+        assert_eq!(mask_prefix("255.255.255.0"), Some(24));
+        assert_eq!(mask_prefix("255.255.0.0"), Some(16));
+        assert_eq!(mask_prefix("255.0.0.0"), Some(8));
+        assert_eq!(mask_prefix("255.255.255.255"), Some(32));
+    }
+
+    #[test]
+    fn mask_prefix_rejects_invalid_masks() {
+        assert_eq!(mask_prefix(""), None);
+        assert_eq!(mask_prefix("255.0.255.0"), None);
+        assert_eq!(mask_prefix("10.0.0.1"), None);
+        assert_eq!(mask_prefix("not-an-ip"), None);
+    }
+
+    #[test]
+    fn mask_prefix_finds_ones_in_octets() {
+        // Any bit pattern that is a contiguous run of 1s from the MSB.
+        assert_eq!(mask_prefix("255.255.255.128"), Some(25));
+        assert_eq!(mask_prefix("255.192.0.0"), Some(10));
     }
 }

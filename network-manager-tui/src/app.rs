@@ -115,6 +115,10 @@ pub struct Form {
     pub selection_open: Option<usize>,
     /// Cursor within an open selection popup.
     pub selection_cursor: usize,
+    /// true when the OK/Cancel footer has focus.
+    pub on_footer: bool,
+    /// 0 = OK, 1 = Cancel.
+    pub footer_sel: usize,
 }
 
 impl Form {
@@ -124,6 +128,8 @@ impl Form {
             focus: 0,
             selection_open: None,
             selection_cursor: 0,
+            on_footer: false,
+            footer_sel: 0,
         }
     }
     /// All visible rows (flattening expanded children), with an index.
@@ -154,6 +160,8 @@ pub enum Modal {
         bssid: Option<String>,
         iface: String,
         input: String,
+        /// 0 = OK, 1 = Cancel (footer focus).
+        footer_sel: usize,
     },
     /// "Connecting..." while a Wi-Fi association is in flight.
     Connecting { ssid: String },
@@ -506,7 +514,7 @@ impl App {
                     area,
                     title.clone(),
                     vec![Line::from(message.clone())],
-                    " Enter/Esc 关闭 ".into(),
+                    0,
                 );
             }
             Modal::Connecting { ssid } => {
@@ -515,10 +523,12 @@ impl App {
                     area,
                     "连接中".into(),
                     vec![Line::from(format!("正在连接 {ssid}…"))],
-                    " 请稍候 ".into(),
+                    0,
                 );
             }
-            Modal::Password { ssid, input, .. } => {
+            Modal::Password {
+                ssid, input, footer_sel, ..
+            } => {
                 self.popup(
                     f,
                     area,
@@ -530,7 +540,7 @@ impl App {
                             Style::default().fg(Color::Yellow),
                         ),
                     ])],
-                    " Enter=连接  Esc=取消 ".into(),
+                    *footer_sel,
                 );
             }
             Modal::Edit { title, iface, form } => {
@@ -574,7 +584,7 @@ impl App {
                     area,
                     format!("{title} — {iface}"),
                     lines,
-                    " ↑/↓ 移动  Enter=选择/保存  Esc=取消 ".into(),
+                    form.footer_sel,
                 );
                 // Selection sub-popup.
                 if let Some(top) = form.selection_open
@@ -639,9 +649,10 @@ impl App {
         area: Rect,
         title: String,
         lines: Vec<Line>,
-        hint: String,
+        footer_sel: usize,
     ) {
-        let height = lines.len() as u16 + 4;
+        // Height: content + a hint line + an OK/Cancel footer line + borders.
+        let height = lines.len() as u16 + 5;
         let width = 56;
         let rect = Rect {
             x: area.x + area.width.saturating_sub(width).saturating_div(2),
@@ -649,10 +660,18 @@ impl App {
             width,
             height,
         };
-        // Darken behind the popup.
         f.render_widget(Clear, rect);
+        let sel = Style::default().add_modifier(Modifier::REVERSED);
+        let ok = if footer_sel == 0 { "[ OK ]".to_string() } else { " OK  ".to_string() };
+        let cancel = if footer_sel == 1 { "[CANCEL]" } else { " Cancel " };
         let mut content = lines;
-        content.push(Line::from(hint));
+        content.push(Line::from(" ↑/↓=字段  Tab/←/→=OK/Cancel  Enter=确认  Esc=放弃 ".to_string()));
+        content.push(Line::from(vec![
+            Span::styled(
+                format!(" {ok}   {cancel} "),
+                if footer_sel == 0 { sel } else { Style::default() },
+            ),
+        ]));
         f.render_widget(
             Paragraph::new(content)
                 .style(Style::default().bg(Color::DarkGray))
