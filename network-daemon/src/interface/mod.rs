@@ -2,7 +2,11 @@ mod ifconfig;
 mod query;
 mod table;
 
-use std::{collections::HashSet, ops::ControlFlow};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::ControlFlow,
+    path::Path,
+};
 
 use async_channel::Receiver;
 use kameo::{
@@ -15,8 +19,8 @@ use kameo::{
 use libnetwork_daemon::{
     ConnectionState, InterfaceInfo, InterfaceManagerAction,
     InterfaceManagerEvent, InterfaceResponse, InterfaceType, IntoPrefixed,
-    LinkOptions, Modification, PrefixedIpAddr, ensure, error::InterfaceError,
-    utils::Broadcast,
+    LinkOptions, Modification, PrefixedIpAddr, WlanLinkOptions, ensure,
+    error::InterfaceError, utils::Broadcast,
 };
 use netlink_packet_core::{DecodeError, NetlinkMessage, NetlinkPayload};
 use netlink_packet_route::{RouteNetlinkMessage, link::LinkFlags};
@@ -25,11 +29,14 @@ use tracing::{error, info, warn};
 
 use self::ifconfig::Ifconfig;
 use crate::{
+    config::{ConfigError, DaemonConfig},
     ffi,
     netlink::{NetlinkListener, NetlinkModifier, NetlinkQuery},
 };
 
-/// Interface manager using libifconfig
+const CONFIG_PATH: &str = "/var/db/network-daemon/config.toml";
+
+/// Interface manager using FreeBSD kernel interfaces.
 ///
 /// Manages network interfaces and their states
 pub struct InterfaceManager {
@@ -64,16 +71,29 @@ impl InterfaceManager {
             NetlinkQuery::new().map_err(InterfaceError::NetlinkQueryError)?;
         let old_interfaces_set =
             self.table.all().into_iter().collect::<HashSet<_>>();
-        let mut new_interfaces_set = HashSet::new();
-
-        query
+        let mut interfaces = query
             .query_links()
             .await
-            .map_err(InterfaceError::NetlinkQueryError)?
-            .into_values()
-            .for_each(|v| {
-                new_interfaces_set.insert(v.clone());
-            });
+            .map_err(InterfaceError::NetlinkQueryError)?;
+
+        if self.create_configured_links(&interfaces).await {
+            interfaces = query
+                .query_links()
+                .await
+                .map_err(InterfaceError::NetlinkQueryError)?;
+        }
+
+        if self.create_auto_wlans(&interfaces).await {
+            interfaces = query
+                .query_links()
+                .await
+                .map_err(InterfaceError::NetlinkQueryError)?;
+        }
+
+        self.apply_saved_policies(&mut interfaces).await;
+
+        let new_interfaces_set =
+            interfaces.into_values().collect::<HashSet<_>>();
 
         // Determine added and removed interfaces
         let added_interfaces: Vec<InterfaceInfo> = new_interfaces_set
@@ -108,6 +128,288 @@ impl InterfaceManager {
         }
 
         Ok(())
+    }
+
+    /// Apply persisted DHCPv4/SLAAC policy to the live interface snapshot.
+    async fn apply_saved_policies(
+        &self,
+        interfaces: &mut HashMap<u32, InterfaceInfo>,
+    ) {
+        let config = match DaemonConfig::load(Path::new(CONFIG_PATH)) {
+            Ok(config) => config,
+            Err(ConfigError::NotFound(_)) => return,
+            Err(error) => {
+                warn!(
+                    "Skipping persisted interface policy: config.toml could not be loaded: {error}"
+                );
+                return;
+            }
+        };
+        for interface in interfaces.values_mut() {
+            let Some(policy) = config.interface.get(&interface.name) else {
+                continue;
+            };
+            interface.dhcpv4_enabled = policy.dhcpv4;
+            if interface.slaac_enabled == policy.slaac {
+                continue;
+            }
+            match self
+                .ifconfig
+                .set_slaac_state(&interface.name, policy.slaac)
+                .await
+            {
+                Ok(()) => interface.slaac_enabled = policy.slaac,
+                Err(error) => warn!(
+                    "Could not apply SLAAC policy to {}: {}",
+                    interface.name, error
+                ),
+            }
+        }
+    }
+
+    /// Recreate explicitly persisted logical links that are not present.
+    async fn create_configured_links(
+        &self,
+        interfaces: &HashMap<u32, InterfaceInfo>,
+    ) -> bool {
+        let config = match DaemonConfig::load(Path::new(CONFIG_PATH)) {
+            Ok(config) => config,
+            Err(ConfigError::NotFound(_)) => return false,
+            Err(error) => {
+                warn!(
+                    "Skipping persisted interface creation: config.toml could not be loaded: {error}"
+                );
+                return false;
+            }
+        };
+        let mut names = interfaces
+            .values()
+            .map(|interface| interface.name.clone())
+            .collect::<HashSet<_>>();
+        let mut created = false;
+        let mut pending = config
+            .interface
+            .into_iter()
+            .filter_map(|(name, interface_config)| {
+                interface_config.creation.map(|options| (name, options))
+            })
+            .collect::<Vec<_>>();
+
+        // Retry deferred links so a persisted VLAN/bridge/lagg can depend on
+        // another persisted logical link that sorts later in the TOML map.
+        loop {
+            let mut deferred = Vec::new();
+            let mut progress = false;
+            for (name, options) in pending {
+                if names.contains(&name) {
+                    continue;
+                }
+                match self.ifconfig.create_link(&name, &options).await {
+                    Ok(()) => {
+                        info!("Restored persisted interface {}", name);
+                        names.insert(name);
+                        created = true;
+                        progress = true;
+                    }
+                    Err(error) => deferred.push((name, options, error)),
+                }
+            }
+
+            if deferred.is_empty() || !progress {
+                for (name, _options, error) in deferred {
+                    warn!(
+                        "Could not restore persisted interface {}: {}",
+                        name, error
+                    );
+                }
+                break;
+            }
+            pending = deferred
+                .into_iter()
+                .map(|(name, options, _error)| (name, options))
+                .collect();
+        }
+        created
+    }
+
+    /// Create default WLAN interfaces for unconfigured wireless devices.
+    async fn create_auto_wlans(
+        &self,
+        interfaces: &HashMap<u32, InterfaceInfo>,
+    ) -> bool {
+        let config = match DaemonConfig::load(Path::new(CONFIG_PATH)) {
+            Ok(config) => config,
+            Err(ConfigError::NotFound(_)) => DaemonConfig::default(),
+            Err(error) => {
+                warn!(
+                    "Skipping automatic WLAN creation: config.toml could not be loaded: {error}"
+                );
+                return false;
+            }
+        };
+        let devices = match self.ifconfig.wireless_devices().await {
+            Ok(devices) => devices,
+            Err(error) => {
+                warn!("Could not enumerate wireless devices: {}", error);
+                return false;
+            }
+        };
+        let existing_parents = interfaces
+            .values()
+            .filter(|interface| interface.is_wlan())
+            .filter_map(|interface| interface.parent.as_deref())
+            .collect::<HashSet<_>>();
+        let configured_wlan_parents = config
+            .interface
+            .values()
+            .filter_map(|interface_config| match &interface_config.creation {
+                Some(LinkOptions::Wlan { parent, .. }) => Some(parent.as_str()),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        let mut interface_names = interfaces
+            .values()
+            .map(|interface| interface.name.clone())
+            .collect::<HashSet<_>>();
+        let mut next_index = 0u32;
+        let mut created = false;
+
+        for parent in devices {
+            if existing_parents.contains(parent.as_str())
+                || configured_wlan_parents.contains(parent.as_str())
+            {
+                continue;
+            }
+            if let Some(interface_config) = config.interface.get(&parent)
+                && (!interface_config.create_wlan
+                    || interface_config.wlan.is_some())
+            {
+                continue;
+            }
+
+            let name = loop {
+                let candidate = format!("wlan{next_index}");
+                next_index += 1;
+                if interface_names.insert(candidate.clone()) {
+                    break candidate;
+                }
+            };
+            let options = WlanLinkOptions::default();
+            let link = LinkOptions::Wlan {
+                parent: parent.clone(),
+                options,
+            };
+            match self.ifconfig.create_link(&name, &link).await {
+                Ok(()) => {
+                    info!(
+                        "Created WLAN interface {} for wireless device {}",
+                        name, parent
+                    );
+                    created = true;
+                }
+                Err(error) => {
+                    warn!(
+                        "Could not create WLAN interface {} for {}: {}",
+                        name, parent, error
+                    );
+                }
+            }
+        }
+        created
+    }
+
+    fn persist_creation(
+        &self,
+        name: &str,
+        creation: &LinkOptions,
+    ) -> Result<(), InterfaceError> {
+        let mut config = match DaemonConfig::load(Path::new(CONFIG_PATH)) {
+            Ok(config) => config,
+            Err(ConfigError::NotFound(_)) => DaemonConfig::default(),
+            Err(error) => {
+                return Err(InterfaceError::Other(format!(
+                    "could not load interface configuration: {error}"
+                )));
+            }
+        };
+        config
+            .interface
+            .entry(name.to_string())
+            .or_default()
+            .creation = Some(creation.clone());
+        config.save(Path::new(CONFIG_PATH)).map_err(|error| {
+            InterfaceError::Other(format!(
+                "could not persist interface {name}: {error}"
+            ))
+        })
+    }
+
+    fn remove_persisted_creation(
+        &self,
+        name: &str,
+    ) -> Result<(), InterfaceError> {
+        let mut config = match DaemonConfig::load(Path::new(CONFIG_PATH)) {
+            Ok(config) => config,
+            Err(ConfigError::NotFound(_)) => return Ok(()),
+            Err(error) => {
+                return Err(InterfaceError::Other(format!(
+                    "could not load interface configuration: {error}"
+                )));
+            }
+        };
+        let changed = config
+            .interface
+            .get_mut(name)
+            .and_then(|interface| interface.creation.take())
+            .is_some();
+        if changed {
+            config.save(Path::new(CONFIG_PATH)).map_err(|error| {
+                InterfaceError::Other(format!(
+                    "could not persist interface deletion {name}: {error}"
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
+    fn persist_policy(
+        &self,
+        name: &str,
+        slaac: Modification<bool>,
+        dhcpv4: Modification<bool>,
+    ) -> Result<(), InterfaceError> {
+        let slaac_value = match slaac {
+            Modification::Replace(value) => Some(value),
+            _ => None,
+        };
+        let dhcpv4_value = match dhcpv4 {
+            Modification::Replace(value) => Some(value),
+            _ => None,
+        };
+        if slaac_value.is_none() && dhcpv4_value.is_none() {
+            return Ok(());
+        }
+        let mut config = match DaemonConfig::load(Path::new(CONFIG_PATH)) {
+            Ok(config) => config,
+            Err(ConfigError::NotFound(_)) => DaemonConfig::default(),
+            Err(error) => {
+                return Err(InterfaceError::Other(format!(
+                    "could not load interface configuration: {error}"
+                )));
+            }
+        };
+        let interface = config.interface.entry(name.to_string()).or_default();
+        if let Some(value) = slaac_value {
+            interface.slaac = value;
+        }
+        if let Some(value) = dhcpv4_value {
+            interface.dhcpv4 = value;
+        }
+        config.save(Path::new(CONFIG_PATH)).map_err(|error| {
+            InterfaceError::Other(format!(
+                "could not persist interface policy {name}: {error}"
+            ))
+        })
     }
 }
 
@@ -225,30 +527,109 @@ impl Message<InterfaceManagerAction> for InterfaceManager {
                 kind,
                 options,
             } => {
-                match kind {
-                    InterfaceType::Bridge => {
-                        self.ifconfig.create_bridge(&name).await?;
-                    }
-                    InterfaceType::Wlan => {
-                        if let Some(LinkOptions::Wlan { parent, options }) =
-                            options
-                        {
-                            self.ifconfig
-                                .create_wlan(
-                                    &name,
-                                    &parent,
-                                    options.mode,
-                                    options.regdomain,
-                                    options.region,
-                                )
-                                .await?;
-                        } else {
-                            Err("Missing WLAN link options for creation")?
+                if self.get_interface(&name).is_some() {
+                    return Err(InterfaceError::Other(format!(
+                        "interface already exists: {name}"
+                    )));
+                }
+
+                let creation = match kind {
+                    InterfaceType::Wlan => match options {
+                        Some(LinkOptions::Wlan { parent, options }) => {
+                            LinkOptions::Wlan { parent, options }
                         }
+                        Some(_) => {
+                            return Err(InterfaceError::Other(
+                                "WLAN creation requires WLAN link options"
+                                    .to_string(),
+                            ));
+                        }
+                        None => {
+                            let parent = self
+                                .ifconfig
+                                .wireless_devices()
+                                .await?
+                                .into_iter()
+                                .next()
+                                .ok_or_else(|| {
+                                    InterfaceError::Other(
+                                        "no wireless device is available"
+                                            .to_string(),
+                                    )
+                                })?;
+                            LinkOptions::Wlan {
+                                parent,
+                                options: WlanLinkOptions::default(),
+                            }
+                        }
+                    },
+                    InterfaceType::Bridge => match options {
+                        None => LinkOptions::Bridge {
+                            members: Vec::new(),
+                        },
+                        Some(LinkOptions::Bridge { members }) => {
+                            LinkOptions::Bridge { members }
+                        }
+                        Some(_) => {
+                            return Err(InterfaceError::Other(
+                                "bridge creation requires bridge link options"
+                                    .to_string(),
+                            ));
+                        }
+                    },
+                    InterfaceType::Lagg => match options {
+                        None => LinkOptions::Lagg {
+                            protocol: Default::default(),
+                            members: Vec::new(),
+                        },
+                        Some(LinkOptions::Lagg { protocol, members }) => {
+                            LinkOptions::Lagg { protocol, members }
+                        }
+                        Some(_) => {
+                            return Err(InterfaceError::Other(
+                                "lagg creation requires lagg link options"
+                                    .to_string(),
+                            ));
+                        }
+                    },
+                    InterfaceType::Vlan => match options {
+                        Some(LinkOptions::Vlan { parent, tag }) => {
+                            LinkOptions::Vlan { parent, tag }
+                        }
+                        None => {
+                            return Err(InterfaceError::Other(
+                                "VLAN creation requires a parent and tag"
+                                    .to_string(),
+                            ));
+                        }
+                        Some(_) => {
+                            return Err(InterfaceError::Other(
+                                "VLAN creation requires VLAN link options"
+                                    .to_string(),
+                            ));
+                        }
+                    },
+                    _ => {
+                        return Err(InterfaceError::Other(format!(
+                            "{kind:?} interfaces are provided by the kernel and can only be configured"
+                        )));
                     }
-                    _ => Err("Interface type not supported for creation")?,
                 };
 
+                self.ifconfig.create_link(&name, &creation).await?;
+                if let Err(error) = self.persist_creation(&name, &creation) {
+                    if let Err(cleanup) =
+                        self.ifconfig.destroy_link(&name).await
+                    {
+                        warn!(
+                            "Could not roll back interface {} after persistence failure: {}",
+                            name, cleanup
+                        );
+                    }
+                    return Err(error);
+                }
+
+                self.refresh_interfaces(ctx.actor_ref()).await?;
                 Ok(InterfaceResponse::Success(()))
             }
             InterfaceManagerAction::DelLink { name } => {
@@ -256,8 +637,10 @@ impl Message<InterfaceManagerAction> for InterfaceManager {
                 if let Some(info) = self.get_interface(&name) {
                     modifier.del_link(info.id).await?;
                 } else {
-                    Err(InterfaceError::NotFound(name))?;
+                    return Err(InterfaceError::NotFound(name));
                 }
+
+                self.remove_persisted_creation(&name)?;
 
                 Ok(InterfaceResponse::Success(()))
             }
@@ -358,6 +741,7 @@ impl Message<InterfaceManagerAction> for InterfaceManager {
                         ))
                         .await;
                 }
+                self.persist_policy(&name, slaac, dhcpv4)?;
                 Ok(InterfaceResponse::Success(()))
             }
             InterfaceManagerAction::DhcpV4Set {
@@ -534,6 +918,11 @@ impl Message<InterfaceManagerAction> for InterfaceManager {
             InterfaceManagerAction::GetInterfacesByState { state } => {
                 let list = self.list_by_state(state);
                 Ok(InterfaceResponse::InfoList(list))
+            }
+            InterfaceManagerAction::GetWirelessDevices => {
+                Ok(InterfaceResponse::WirelessDevices(
+                    self.ifconfig.wireless_devices().await?,
+                ))
             }
             InterfaceManagerAction::SubscribeEvents => {
                 let subscriber = self.event_broadcaster.subscribe();

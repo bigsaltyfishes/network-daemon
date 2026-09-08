@@ -1,4 +1,4 @@
-use std::ffi::CString;
+use std::{ffi::CString, time::Duration};
 
 use async_net::unix::UnixStream;
 use futures_lite::{
@@ -197,11 +197,9 @@ where
                     },
                     DaemonCommand::WiFiManager { iface, action } => {
                         // Check if wifi manager exists for interface
-                        let wifi_mgr_ident = format!("WiFiManager-{}", iface);
-                        let wifi_mgr = if let Ok(Some(mgr)) =
-                            ActorRef::<WifiManager<W>>::lookup(
-                                wifi_mgr_ident.as_str(),
-                            ) {
+                        let wifi_mgr = if let Some(mgr) =
+                            Self::lookup_wifi_manager(&iface).await
+                        {
                             mgr
                         } else {
                             let ret = DaemonResponse::Global {
@@ -493,6 +491,29 @@ impl<W> ClientHandler<W>
 where
     W: WifiManagerBackend,
 {
+    /// Wait briefly for the supervisor spawned by an InterfaceAdded event.
+    ///
+    /// Creating a WLAN is a two-actor operation: InterfaceManager reports the
+    /// new link first, then NetworkDaemon starts its WifiManager supervisor.
+    /// A TUI can legitimately send AddNetwork immediately after AddLink, so a
+    /// one-shot registry lookup would race that startup sequence.
+    async fn lookup_wifi_manager(
+        iface: &str,
+    ) -> Option<ActorRef<WifiManager<W>>> {
+        let identifier = format!("WiFiManager-{iface}");
+        for attempt in 0..20 {
+            if let Ok(Some(manager)) =
+                ActorRef::<WifiManager<W>>::lookup(identifier.as_str())
+            {
+                return Some(manager);
+            }
+            if attempt < 19 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+        None
+    }
+
     /// Read the live kernel hostname for the hostname activity.
     fn read_hostname() -> Result<String, std::io::Error> {
         let mut buffer = [0u8; 256];

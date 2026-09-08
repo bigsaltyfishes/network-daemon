@@ -7,10 +7,11 @@
 
 use std::{collections::BTreeMap, path::Path};
 
+use libnetwork_daemon::{LinkOptions, WlanLinkOptions};
 use thiserror::Error;
 
 /// Per-interface persisted settings (non-sensitive).
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct InterfaceConfig {
     /// Accept kernel Router Advertisements (SLAAC) for IPv6.
     #[serde(default)]
@@ -18,6 +19,32 @@ pub struct InterfaceConfig {
     /// Run the internal DHCPv4 client.
     #[serde(default = "default_true")]
     pub dhcpv4: bool,
+    /// Allow automatic WLAN interface creation for this device.
+    ///
+    /// This defaults to true for backwards compatibility. Setting it to
+    /// false gives the device to an external interface manager.
+    #[serde(default = "default_true")]
+    pub create_wlan: bool,
+    /// Explicit WLAN creation parameters. Their presence opts this device
+    /// out of the daemon's default automatic creation path.
+    #[serde(default)]
+    pub wlan: Option<WlanLinkOptions>,
+    /// Explicit logical-interface creation parameters. When present, the
+    /// daemon recreates the link during interface refresh if it is missing.
+    #[serde(default)]
+    pub creation: Option<LinkOptions>,
+}
+
+impl Default for InterfaceConfig {
+    fn default() -> Self {
+        Self {
+            slaac: false,
+            dhcpv4: true,
+            create_wlan: true,
+            wlan: None,
+            creation: None,
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -89,6 +116,11 @@ impl DaemonConfig {
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
         let text = toml::to_string(self)
             .map_err(|e| ConfigError::Parse(e.to_string()))?;
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(ConfigError::Read)?;
+        }
         let tmp = path.with_extension("toml.tmp");
         std::fs::write(&tmp, text).map_err(ConfigError::Read)?;
         std::fs::rename(&tmp, path).map_err(ConfigError::Read)
@@ -119,6 +151,7 @@ impl DaemonConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use libnetwork_daemon::{CountryCode, RegDomain, WlanMode};
 
     #[test]
     fn parse_empty_is_default() {
@@ -157,6 +190,73 @@ slaac = true
         let ifc = &cfg.interface["eth0"];
         assert!(ifc.slaac);
         assert!(ifc.dhcpv4); // default true
+        assert!(ifc.create_wlan); // default true
+        assert!(ifc.wlan.is_none());
+        assert!(ifc.creation.is_none());
+    }
+
+    #[test]
+    fn parse_wireless_creation_policy() {
+        let text = r#"
+[interface.iwn0]
+create_wlan = false
+
+[interface.ath0.wlan]
+regdomain = "Fcc"
+region = "US"
+mode = "Sta"
+"#;
+        let cfg = DaemonConfig::parse(text).unwrap();
+        assert!(!cfg.interface["iwn0"].create_wlan);
+        assert!(cfg.interface["iwn0"].wlan.is_none());
+        let options = cfg.interface["ath0"].wlan.as_ref().unwrap();
+        assert_eq!(options.regdomain, RegDomain::Fcc);
+        assert_eq!(options.region, CountryCode::US);
+        assert_eq!(options.mode, WlanMode::Sta);
+    }
+
+    #[test]
+    fn parse_logical_interface_creation() {
+        let text = r#"
+[interface.bridge0.creation]
+type = "Bridge"
+members = ["eth0", "eth1"]
+
+[interface.vlan10.creation]
+type = "Vlan"
+parent = "eth0"
+tag = 10
+
+[interface.lagg0.creation]
+type = "Lagg"
+protocol = "lacp"
+members = ["eth0", "eth1"]
+"#;
+        let cfg = DaemonConfig::parse(text).unwrap();
+        assert!(matches!(
+            cfg.interface["bridge0"].creation,
+            Some(LinkOptions::Bridge { ref members })
+                if members == &["eth0".to_string(), "eth1".to_string()]
+        ));
+        assert!(matches!(
+            cfg.interface["vlan10"].creation,
+            Some(LinkOptions::Vlan { ref parent, tag })
+                if parent == "eth0" && tag == 10
+        ));
+        assert!(matches!(
+            cfg.interface["lagg0"].creation,
+            Some(LinkOptions::Lagg { protocol, ref members })
+                if protocol == libnetwork_daemon::LaggProtocol::Lacp
+                    && members.len() == 2
+        ));
+
+        let encoded = toml::to_string(&cfg).unwrap();
+        let decoded = DaemonConfig::parse(&encoded).unwrap();
+        assert!(matches!(
+            decoded.interface["vlan10"].creation,
+            Some(LinkOptions::Vlan { ref parent, tag })
+                if parent == "eth0" && tag == 10
+        ));
     }
 
     #[test]

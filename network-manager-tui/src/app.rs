@@ -6,11 +6,11 @@ use std::{
 };
 
 use libnetwork_daemon::{
-    ConnectionState, DaemonCommand, DaemonResponse, GlobalDaemonAction,
-    GlobalDaemonResponse, InterfaceInfo, InterfaceManagerAction,
-    InterfaceResponse, InterfaceType, KnownNetwork, MacAddr, Modification,
+    DaemonCommand, DaemonResponse, GlobalDaemonAction, GlobalDaemonResponse,
+    InterfaceInfo, InterfaceManagerAction, InterfaceResponse, InterfaceType,
+    KnownNetwork, LaggProtocol, LinkOptions, MacAddr, Modification,
     PrefixedIpv4Addr, PrefixedIpv6Addr, ScanResult, Security, SupplicantStatus,
-    WiFiManagerAction, WiFiManagerResponse, WpaState,
+    WiFiManagerAction, WiFiManagerResponse, WlanLinkOptions, WpaState,
 };
 use ratatui::{
     Frame,
@@ -51,6 +51,7 @@ pub enum Popup {
     None,
     Message(MessagePopup),
     NewConnection(NewConnectionPopup),
+    WirelessDevices(WirelessDevicePopup),
     Password(PasswordPopup),
     Connecting(ConnectingPopup),
     Editor(Box<ConnectionEditor>),
@@ -73,6 +74,20 @@ enum NewFocus {
 pub(crate) struct NewConnectionPopup {
     selected: usize,
     focus: NewFocus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WirelessDeviceFocus {
+    List,
+    Cancel,
+    Select,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct WirelessDevicePopup {
+    devices: Vec<String>,
+    selected: usize,
+    focus: WirelessDeviceFocus,
 }
 
 #[derive(Debug, Clone)]
@@ -129,6 +144,7 @@ struct ActivationRow {
     label: String,
     signal: Option<i32>,
     target: Option<ActivationTarget>,
+    active: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,9 +171,39 @@ enum EditorMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListField {
+    Ipv4Addresses,
+    Ipv4Dns,
+    Ipv4Search,
+    Ipv6Addresses,
+    Ipv6Dns,
+    Ipv6Search,
+}
+
+impl ListField {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ipv4Addresses | Self::Ipv6Addresses => "Addresses",
+            Self::Ipv4Dns | Self::Ipv6Dns => "DNS servers",
+            Self::Ipv4Search | Self::Ipv6Search => "Search domains",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListAction {
+    Value,
+    Remove,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EditorField {
     ProfileName,
     Device,
+    CreationParent,
+    CreationMembers,
+    CreationProtocol,
+    VlanTag,
     Ssid,
     Bssid,
     Security,
@@ -165,10 +211,9 @@ enum EditorField {
     Password,
     Hidden,
     Ipv4Mode,
-    Ipv4Address,
+    ListValue(ListField, usize),
+    ListAdd(ListField),
     Ipv4Gateway,
-    Ipv4Dns,
-    Ipv4Search,
     Ipv4Routing,
     Ipv4NeverDefault,
     Ipv4IgnoreRoutes,
@@ -176,10 +221,9 @@ enum EditorField {
     Ipv4Required,
     Ipv6Mode,
     Slaac,
-    Ipv6Address,
+    // IPv6 addresses, DNS servers, and search domains use the same list
+    // field variants as their IPv4 counterparts.
     Ipv6Gateway,
-    Ipv6Dns,
-    Ipv6Search,
     Ipv6Routing,
     Ipv6NeverDefault,
     Ipv6IgnoreRoutes,
@@ -199,18 +243,16 @@ impl EditorField {
             self,
             Self::ProfileName
                 | Self::Device
+                | Self::CreationParent
+                | Self::CreationMembers
+                | Self::VlanTag
                 | Self::Ssid
                 | Self::Bssid
                 | Self::Identity
                 | Self::Password
-                | Self::Ipv4Address
                 | Self::Ipv4Gateway
-                | Self::Ipv4Dns
-                | Self::Ipv4Search
-                | Self::Ipv6Address
                 | Self::Ipv6Gateway
-                | Self::Ipv6Dns
-                | Self::Ipv6Search
+                | Self::ListValue(..)
         )
     }
 
@@ -230,6 +272,28 @@ impl EditorField {
                 | Self::Autoconnect
                 | Self::AvailableUsers
         )
+    }
+
+    fn list_kind(self) -> Option<ListField> {
+        match self {
+            Self::ListValue(kind, _) | Self::ListAdd(kind) => Some(kind),
+            _ => None,
+        }
+    }
+
+    fn list_value(self) -> Option<(ListField, usize)> {
+        match self {
+            Self::ListValue(kind, index) => Some((kind, index)),
+            _ => None,
+        }
+    }
+
+    fn is_list_value(self) -> bool {
+        matches!(self, Self::ListValue(..))
+    }
+
+    fn is_list_add(self) -> bool {
+        matches!(self, Self::ListAdd(..))
     }
 }
 
@@ -414,6 +478,11 @@ impl RoutingPopup {
 #[derive(Debug, Clone)]
 pub struct ConnectionEditor {
     mode: EditorMode,
+    creation_kind: Option<InterfaceType>,
+    creation_parent: String,
+    creation_members: String,
+    creation_protocol: LaggProtocol,
+    creation_vlan_tag: String,
     profile_name: String,
     device: String,
     ssid: String,
@@ -423,10 +492,10 @@ pub struct ConnectionEditor {
     password: String,
     hidden: bool,
     ipv4_mode: IpMode,
-    ipv4_address: String,
+    ipv4_addresses: Vec<String>,
     ipv4_gateway: String,
-    ipv4_dns: String,
-    ipv4_search: String,
+    ipv4_dns: Vec<String>,
+    ipv4_search: Vec<String>,
     ipv4_routes: Vec<String>,
     ipv4_never_default: bool,
     ipv4_ignore_routes: bool,
@@ -434,10 +503,10 @@ pub struct ConnectionEditor {
     ipv4_required: bool,
     ipv6_mode: IpMode,
     slaac: bool,
-    ipv6_address: String,
+    ipv6_addresses: Vec<String>,
     ipv6_gateway: String,
-    ipv6_dns: String,
-    ipv6_search: String,
+    ipv6_dns: Vec<String>,
+    ipv6_search: Vec<String>,
     ipv6_routes: Vec<String>,
     ipv6_never_default: bool,
     ipv6_ignore_routes: bool,
@@ -447,27 +516,26 @@ pub struct ConnectionEditor {
     available_users: bool,
     existing_network: Option<(String, Option<MacAddr>)>,
     focus: usize,
+    list_action: ListAction,
     footer: bool,
     footer_selected: usize,
     choice: Option<ChoicePopup>,
     routing: Option<RoutingPopup>,
-    scroll: u16,
 }
 
 impl ConnectionEditor {
     fn from_interface(iface: &InterfaceInfo) -> Self {
-        let ipv4_address = iface
-            .ipv4_addrs
-            .first()
-            .map(ToString::to_string)
-            .unwrap_or_default();
-        let ipv6_address = iface
-            .ipv6_addrs
-            .first()
-            .map(ToString::to_string)
-            .unwrap_or_default();
+        let ipv4_addresses =
+            iface.ipv4_addrs.iter().map(ToString::to_string).collect();
+        let ipv6_addresses =
+            iface.ipv6_addrs.iter().map(ToString::to_string).collect();
         Self {
             mode: EditorMode::Ethernet,
+            creation_kind: None,
+            creation_parent: String::new(),
+            creation_members: String::new(),
+            creation_protocol: LaggProtocol::default(),
+            creation_vlan_tag: String::new(),
             profile_name: iface.name.clone(),
             device: iface.name.clone(),
             ssid: String::new(),
@@ -481,14 +549,14 @@ impl ConnectionEditor {
             } else {
                 IpMode::Manual
             },
-            ipv4_address,
+            ipv4_addresses,
             ipv4_gateway: iface
                 .gateway_ipv4
                 .as_ref()
                 .map(|address| address.addr.to_string())
                 .unwrap_or_default(),
-            ipv4_dns: String::new(),
-            ipv4_search: String::new(),
+            ipv4_dns: Vec::new(),
+            ipv4_search: Vec::new(),
             ipv4_routes: Vec::new(),
             ipv4_never_default: false,
             ipv4_ignore_routes: false,
@@ -502,14 +570,14 @@ impl ConnectionEditor {
                 IpMode::Manual
             },
             slaac: iface.slaac_enabled,
-            ipv6_address,
+            ipv6_addresses,
             ipv6_gateway: iface
                 .gateway_ipv6
                 .as_ref()
                 .map(|address| address.addr.to_string())
                 .unwrap_or_default(),
-            ipv6_dns: String::new(),
-            ipv6_search: String::new(),
+            ipv6_dns: Vec::new(),
+            ipv6_search: Vec::new(),
             ipv6_routes: Vec::new(),
             ipv6_never_default: false,
             ipv6_ignore_routes: false,
@@ -519,11 +587,11 @@ impl ConnectionEditor {
             available_users: true,
             existing_network: None,
             focus: 0,
+            list_action: ListAction::Value,
             footer: false,
             footer_selected: 0,
             choice: None,
             routing: None,
-            scroll: 0,
         }
     }
 
@@ -550,6 +618,11 @@ impl ConnectionEditor {
             .unwrap_or_default();
         Self {
             mode: EditorMode::Wifi,
+            creation_kind: None,
+            creation_parent: String::new(),
+            creation_members: String::new(),
+            creation_protocol: LaggProtocol::default(),
+            creation_vlan_tag: String::new(),
             profile_name: ssid.clone(),
             device: iface.to_string(),
             ssid,
@@ -563,10 +636,10 @@ impl ConnectionEditor {
                 .unwrap_or_default(),
             hidden: known.is_some_and(|network| network.hidden),
             ipv4_mode: IpMode::Automatic,
-            ipv4_address: String::new(),
+            ipv4_addresses: Vec::new(),
             ipv4_gateway: String::new(),
-            ipv4_dns: String::new(),
-            ipv4_search: String::new(),
+            ipv4_dns: Vec::new(),
+            ipv4_search: Vec::new(),
             ipv4_routes: Vec::new(),
             ipv4_never_default: false,
             ipv4_ignore_routes: false,
@@ -574,10 +647,10 @@ impl ConnectionEditor {
             ipv4_required: false,
             ipv6_mode: IpMode::Automatic,
             slaac: true,
-            ipv6_address: String::new(),
+            ipv6_addresses: Vec::new(),
             ipv6_gateway: String::new(),
-            ipv6_dns: String::new(),
-            ipv6_search: String::new(),
+            ipv6_dns: Vec::new(),
+            ipv6_search: Vec::new(),
             ipv6_routes: Vec::new(),
             ipv6_never_default: false,
             ipv6_ignore_routes: false,
@@ -588,16 +661,52 @@ impl ConnectionEditor {
             existing_network: known
                 .map(|network| (network.ssid.clone(), network.bssid)),
             focus: 0,
+            list_action: ListAction::Value,
             footer: false,
             footer_selected: 0,
             choice: None,
             routing: None,
-            scroll: 0,
         }
+    }
+
+    fn from_new_wifi(parent: &str, iface: &str) -> Self {
+        let mut editor = Self::from_wifi(iface, None, None);
+        editor.creation_kind = Some(InterfaceType::Wlan);
+        editor.creation_parent = parent.to_string();
+        editor
+    }
+
+    fn from_new_link(kind: InterfaceType, name: &str) -> Self {
+        let mut editor = Self::from_interface(&InterfaceInfo::new(0, name));
+        editor.creation_kind = Some(kind);
+        editor.profile_name = name.to_string();
+        editor.device = name.to_string();
+        if kind == InterfaceType::Vlan {
+            editor.creation_vlan_tag = "1".to_string();
+        }
+        editor
     }
 
     fn fields(&self) -> Vec<EditorField> {
         let mut fields = vec![EditorField::ProfileName, EditorField::Device];
+        match self.creation_kind {
+            Some(InterfaceType::Wlan) => {
+                fields.push(EditorField::CreationParent);
+            }
+            Some(InterfaceType::Vlan) => {
+                fields.extend([
+                    EditorField::CreationParent,
+                    EditorField::VlanTag,
+                ]);
+            }
+            Some(InterfaceType::Bridge | InterfaceType::Lagg) => {
+                if self.creation_kind == Some(InterfaceType::Lagg) {
+                    fields.push(EditorField::CreationProtocol);
+                }
+                fields.push(EditorField::CreationMembers);
+            }
+            Some(_) | None => {}
+        }
         if self.mode == EditorMode::Wifi {
             fields.extend([
                 EditorField::Ssid,
@@ -612,12 +721,12 @@ impl ConnectionEditor {
             }
             fields.push(EditorField::Hidden);
         }
+        fields.extend([EditorField::Ipv4Mode]);
+        fields.extend(self.list_fields(ListField::Ipv4Addresses));
+        fields.extend([EditorField::Ipv4Gateway]);
+        fields.extend(self.list_fields(ListField::Ipv4Dns));
+        fields.extend(self.list_fields(ListField::Ipv4Search));
         fields.extend([
-            EditorField::Ipv4Mode,
-            EditorField::Ipv4Address,
-            EditorField::Ipv4Gateway,
-            EditorField::Ipv4Dns,
-            EditorField::Ipv4Search,
             EditorField::Ipv4Routing,
             EditorField::Ipv4NeverDefault,
             EditorField::Ipv4IgnoreRoutes,
@@ -625,10 +734,12 @@ impl ConnectionEditor {
             EditorField::Ipv4Required,
             EditorField::Ipv6Mode,
             EditorField::Slaac,
-            EditorField::Ipv6Address,
-            EditorField::Ipv6Gateway,
-            EditorField::Ipv6Dns,
-            EditorField::Ipv6Search,
+        ]);
+        fields.extend(self.list_fields(ListField::Ipv6Addresses));
+        fields.extend([EditorField::Ipv6Gateway]);
+        fields.extend(self.list_fields(ListField::Ipv6Dns));
+        fields.extend(self.list_fields(ListField::Ipv6Search));
+        fields.extend([
             EditorField::Ipv6Routing,
             EditorField::Ipv6NeverDefault,
             EditorField::Ipv6IgnoreRoutes,
@@ -640,6 +751,15 @@ impl ConnectionEditor {
         fields
     }
 
+    fn list_fields(&self, kind: ListField) -> Vec<EditorField> {
+        let values = self.list_values(kind);
+        let mut fields = (0..values.len())
+            .map(|index| EditorField::ListValue(kind, index))
+            .collect::<Vec<_>>();
+        fields.push(EditorField::ListAdd(kind));
+        fields
+    }
+
     fn focused(&self, field: EditorField) -> bool {
         self.fields().get(self.focus).copied() == Some(field)
     }
@@ -648,6 +768,10 @@ impl ConnectionEditor {
         match field {
             EditorField::ProfileName => "Profile name",
             EditorField::Device => "Device",
+            EditorField::CreationParent => "Parent device",
+            EditorField::CreationMembers => "Member devices",
+            EditorField::CreationProtocol => "LAGG protocol",
+            EditorField::VlanTag => "VLAN ID",
             EditorField::Ssid => "SSID",
             EditorField::Bssid => "BSSID",
             EditorField::Security => "Security",
@@ -655,10 +779,10 @@ impl ConnectionEditor {
             EditorField::Password => "Password",
             EditorField::Hidden => "Hidden network",
             EditorField::Ipv4Mode => "IPv4 CONFIGURATION",
-            EditorField::Ipv4Address => "Addresses",
+            EditorField::ListValue(kind, _) | EditorField::ListAdd(kind) => {
+                kind.label()
+            }
             EditorField::Ipv4Gateway => "Gateway",
-            EditorField::Ipv4Dns => "DNS servers",
-            EditorField::Ipv4Search => "Search domains",
             EditorField::Ipv4Routing => "Routing",
             EditorField::Ipv4NeverDefault => {
                 "Never use this network for default route"
@@ -674,10 +798,7 @@ impl ConnectionEditor {
             }
             EditorField::Ipv6Mode => "IPv6 CONFIGURATION",
             EditorField::Slaac => "Accept IPv6 router advertisements (SLAAC)",
-            EditorField::Ipv6Address => "Addresses",
             EditorField::Ipv6Gateway => "Gateway",
-            EditorField::Ipv6Dns => "DNS servers",
-            EditorField::Ipv6Search => "Search domains",
             EditorField::Ipv6Routing => "Routing",
             EditorField::Ipv6NeverDefault => {
                 "Never use this network for default route"
@@ -696,22 +817,46 @@ impl ConnectionEditor {
         }
     }
 
+    fn list_values(&self, kind: ListField) -> &[String] {
+        match kind {
+            ListField::Ipv4Addresses => &self.ipv4_addresses,
+            ListField::Ipv4Dns => &self.ipv4_dns,
+            ListField::Ipv4Search => &self.ipv4_search,
+            ListField::Ipv6Addresses => &self.ipv6_addresses,
+            ListField::Ipv6Dns => &self.ipv6_dns,
+            ListField::Ipv6Search => &self.ipv6_search,
+        }
+    }
+
+    fn list_values_mut(&mut self, kind: ListField) -> &mut Vec<String> {
+        match kind {
+            ListField::Ipv4Addresses => &mut self.ipv4_addresses,
+            ListField::Ipv4Dns => &mut self.ipv4_dns,
+            ListField::Ipv4Search => &mut self.ipv4_search,
+            ListField::Ipv6Addresses => &mut self.ipv6_addresses,
+            ListField::Ipv6Dns => &mut self.ipv6_dns,
+            ListField::Ipv6Search => &mut self.ipv6_search,
+        }
+    }
+
     fn text_value(&self, field: EditorField) -> &str {
         match field {
             EditorField::ProfileName => &self.profile_name,
             EditorField::Device => &self.device,
+            EditorField::CreationParent => &self.creation_parent,
+            EditorField::CreationMembers => &self.creation_members,
+            EditorField::VlanTag => &self.creation_vlan_tag,
             EditorField::Ssid => &self.ssid,
             EditorField::Bssid => &self.bssid,
             EditorField::Identity => &self.identity,
             EditorField::Password => &self.password,
-            EditorField::Ipv4Address => &self.ipv4_address,
             EditorField::Ipv4Gateway => &self.ipv4_gateway,
-            EditorField::Ipv4Dns => &self.ipv4_dns,
-            EditorField::Ipv4Search => &self.ipv4_search,
-            EditorField::Ipv6Address => &self.ipv6_address,
             EditorField::Ipv6Gateway => &self.ipv6_gateway,
-            EditorField::Ipv6Dns => &self.ipv6_dns,
-            EditorField::Ipv6Search => &self.ipv6_search,
+            EditorField::ListValue(kind, index) => self
+                .list_values(kind)
+                .get(index)
+                .map(String::as_str)
+                .unwrap_or_default(),
             _ => "",
         }
     }
@@ -720,18 +865,18 @@ impl ConnectionEditor {
         match field {
             EditorField::ProfileName => Some(&mut self.profile_name),
             EditorField::Device => Some(&mut self.device),
+            EditorField::CreationParent => Some(&mut self.creation_parent),
+            EditorField::CreationMembers => Some(&mut self.creation_members),
+            EditorField::VlanTag => Some(&mut self.creation_vlan_tag),
             EditorField::Ssid => Some(&mut self.ssid),
             EditorField::Bssid => Some(&mut self.bssid),
             EditorField::Identity => Some(&mut self.identity),
             EditorField::Password => Some(&mut self.password),
-            EditorField::Ipv4Address => Some(&mut self.ipv4_address),
             EditorField::Ipv4Gateway => Some(&mut self.ipv4_gateway),
-            EditorField::Ipv4Dns => Some(&mut self.ipv4_dns),
-            EditorField::Ipv4Search => Some(&mut self.ipv4_search),
-            EditorField::Ipv6Address => Some(&mut self.ipv6_address),
             EditorField::Ipv6Gateway => Some(&mut self.ipv6_gateway),
-            EditorField::Ipv6Dns => Some(&mut self.ipv6_dns),
-            EditorField::Ipv6Search => Some(&mut self.ipv6_search),
+            EditorField::ListValue(kind, index) => {
+                self.list_values_mut(kind).get_mut(index)
+            }
             _ => None,
         }
     }
@@ -798,6 +943,19 @@ impl ConnectionEditor {
                     .map(str::to_string)
                     .collect(),
             ),
+            EditorField::CreationProtocol => Some(
+                [
+                    "failover",
+                    "lacp",
+                    "loadbalance",
+                    "roundrobin",
+                    "broadcast",
+                    "none",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            ),
             EditorField::Ipv4Mode | EditorField::Ipv6Mode => Some(
                 ["Automatic", "Manual", "Ignore"]
                     .into_iter()
@@ -816,6 +974,9 @@ impl ConnectionEditor {
                 Security::Eap => "WPA & WPA2 Enterprise",
                 Security::Unknown => "None",
             },
+            EditorField::CreationProtocol => {
+                Self::lagg_protocol_label(self.creation_protocol)
+            }
             EditorField::Ipv4Mode => self.ipv4_mode.label(),
             EditorField::Ipv6Mode => self.ipv6_mode.label(),
             _ => "",
@@ -836,6 +997,16 @@ impl ConnectionEditor {
                     1 => Security::Psk,
                     2 => Security::Eap,
                     _ => Security::Open,
+                };
+            }
+            EditorField::CreationProtocol => {
+                self.creation_protocol = match choice.selected {
+                    1 => LaggProtocol::Lacp,
+                    2 => LaggProtocol::Loadbalance,
+                    3 => LaggProtocol::Roundrobin,
+                    4 => LaggProtocol::Broadcast,
+                    5 => LaggProtocol::None,
+                    _ => LaggProtocol::Failover,
                 };
             }
             EditorField::Ipv4Mode => {
@@ -861,6 +1032,7 @@ impl ConnectionEditor {
             return;
         };
         if field.is_text()
+            && (!field.is_list_value() || self.list_action == ListAction::Value)
             && let Some(value) = self.text_value_mut(field)
         {
             value.push(character);
@@ -872,10 +1044,58 @@ impl ConnectionEditor {
             return;
         };
         if field.is_text()
+            && (!field.is_list_value() || self.list_action == ListAction::Value)
             && let Some(value) = self.text_value_mut(field)
         {
             value.pop();
         }
+    }
+
+    fn move_list_action(&mut self) {
+        if self
+            .fields()
+            .get(self.focus)
+            .is_some_and(|field| field.is_list_value())
+        {
+            self.list_action = match self.list_action {
+                ListAction::Value => ListAction::Remove,
+                ListAction::Remove => ListAction::Value,
+            };
+        }
+    }
+
+    fn focus_field(&mut self, field: EditorField) {
+        if let Some(index) = self
+            .fields()
+            .iter()
+            .position(|candidate| *candidate == field)
+        {
+            self.focus = index;
+            self.list_action = ListAction::Value;
+            self.choice = None;
+            self.routing = None;
+        }
+    }
+
+    fn add_list_value(&mut self, kind: ListField) {
+        let list = self.list_values_mut(kind);
+        list.push(String::new());
+        let index = list.len() - 1;
+        self.focus_field(EditorField::ListValue(kind, index));
+    }
+
+    fn remove_list_value(&mut self, kind: ListField, index: usize) {
+        let list = self.list_values_mut(kind);
+        if index >= list.len() {
+            return;
+        }
+        list.remove(index);
+        let target = if list.is_empty() {
+            EditorField::ListAdd(kind)
+        } else {
+            EditorField::ListValue(kind, index.min(list.len() - 1))
+        };
+        self.focus_field(target);
     }
 
     fn move_focus(&mut self, delta: isize) {
@@ -885,9 +1105,9 @@ impl ConnectionEditor {
         }
         self.focus = (self.focus as isize + delta).clamp(0, length as isize - 1)
             as usize;
+        self.list_action = ListAction::Value;
         self.choice = None;
         self.routing = None;
-        self.scroll = self.focus.saturating_sub(8) as u16;
     }
 
     fn tab_focus(&mut self, backwards: bool) {
@@ -896,36 +1116,15 @@ impl ConnectionEditor {
             return;
         }
         if self.footer {
-            if backwards {
-                if self.footer_selected == 0 {
-                    self.footer = false;
-                    self.focus = length - 1;
-                    self.scroll = self.focus.saturating_sub(8) as u16;
-                } else {
-                    self.footer_selected = 0;
-                }
-            } else if self.footer_selected == 1 {
-                self.footer = false;
-                self.focus = 0;
-                self.scroll = 0;
-            } else {
-                self.footer_selected = 1;
-            }
+            // Cancel and OK are one horizontal action group. Tab switches
+            // between the form and that group; Left/Right selects a button
+            // inside the group. Keep the form focus so returning does not
+            // move the cursor or reset the scroll position.
+            self.footer = false;
             return;
         }
-        if backwards {
-            if self.focus == 0 {
-                self.footer = true;
-                self.footer_selected = 1;
-            } else {
-                self.move_focus(-1);
-            }
-        } else if self.focus + 1 >= length {
-            self.footer = true;
-            self.footer_selected = 0;
-        } else {
-            self.move_focus(1);
-        }
+        self.footer = true;
+        self.footer_selected = usize::from(backwards);
     }
 
     fn open_choice(&mut self) {
@@ -966,7 +1165,6 @@ impl ConnectionEditor {
 
     fn field_line(&self, field: EditorField) -> Line<'static> {
         let label = Self::field_label(field);
-        let focused = self.focused(field);
         let value = self.text_value(field);
         let display = if field == EditorField::Password {
             if value.is_empty() {
@@ -977,44 +1175,87 @@ impl ConnectionEditor {
         } else {
             value.to_string()
         };
-        let display = if display.is_empty()
-            && matches!(
-                field,
-                EditorField::Ipv4Address
-                    | EditorField::Ipv4Dns
-                    | EditorField::Ipv4Search
-                    | EditorField::Ipv6Address
-                    | EditorField::Ipv6Dns
-                    | EditorField::Ipv6Search
-            ) {
-            "<Add...>".to_string()
-        } else {
-            display
-        };
-        let value_style = if focused {
+        let value_style = if self.focused(field) {
             selected_style()
         } else {
             field_style()
         };
         Line::from(vec![
-            Span::styled(format!("{label:<25}"), label_style()),
-            Span::styled(format!(" {display:<38}"), value_style),
+            Span::styled(format!("{label:<20}"), label_style()),
+            Span::styled(format!(" {display:<30}"), value_style),
         ])
     }
 
+    fn list_value_line(&self, kind: ListField, index: usize) -> Line<'static> {
+        let field = EditorField::ListValue(kind, index);
+        let value = self.text_value(field);
+        let value_style =
+            if self.focused(field) && self.list_action == ListAction::Value {
+                selected_style()
+            } else {
+                field_style()
+            };
+        let remove_style =
+            if self.focused(field) && self.list_action == ListAction::Remove {
+                selected_style()
+            } else {
+                panel_style().add_modifier(Modifier::BOLD)
+            };
+        let label = if index == 0 { kind.label() } else { "" };
+        Line::from(vec![
+            Span::styled(format!("{label:<20}"), label_style()),
+            Span::styled(format!(" {value:<30}"), value_style),
+            Span::styled("<Remove>", remove_style),
+        ])
+    }
+
+    fn list_add_line(&self, kind: ListField) -> Line<'static> {
+        let field = EditorField::ListAdd(kind);
+        let label = if self.list_values(kind).is_empty() {
+            kind.label()
+        } else {
+            ""
+        };
+        let action_style = if self.focused(field) {
+            selected_style()
+        } else {
+            field_style()
+        };
+        Line::from(vec![
+            Span::styled(format!("{label:<20}"), label_style()),
+            Span::styled(" <Add...>", action_style),
+        ])
+    }
+
+    fn push_list_rows(
+        &self,
+        rows: &mut Vec<(Option<EditorField>, Line<'static>)>,
+        kind: ListField,
+    ) {
+        for field in self.list_fields(kind) {
+            let line = match field {
+                EditorField::ListValue(kind, index) => {
+                    self.list_value_line(kind, index)
+                }
+                EditorField::ListAdd(kind) => self.list_add_line(kind),
+                _ => unreachable!("list_fields only returns list controls"),
+            };
+            rows.push((Some(field), line));
+        }
+    }
+
     fn selection_line(&self, field: EditorField, value: &str) -> Line<'static> {
-        let focused = self.focused(field);
-        let style = if focused {
+        let value_style = if self.focused(field) {
             selected_style()
         } else {
             field_style()
         };
         Line::from(vec![
             Span::styled(
-                format!("{:<25}", Self::field_label(field)),
+                format!("{:<20}", Self::field_label(field)),
                 label_style(),
             ),
-            Span::styled(format!(" <{value}>"), style),
+            Span::styled(format!(" <{value}>"), value_style),
         ])
     }
 
@@ -1049,82 +1290,220 @@ impl ConnectionEditor {
             panel_style().add_modifier(Modifier::BOLD)
         };
         Line::from(vec![
-            Span::styled(format!("{:<25}", "Routing"), label_style()),
+            Span::styled(format!("{:<20}", "Routing"), label_style()),
             Span::styled(format!("({summary}) "), panel_style()),
             Span::styled("<Edit...>", action_style),
         ])
     }
 
-    fn form_lines(&self) -> Vec<Line<'static>> {
-        let mut lines = vec![Line::from("")];
-        lines.push(self.field_line(EditorField::ProfileName));
-        lines.push(self.field_line(EditorField::Device));
-        if self.mode == EditorMode::Wifi {
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled("- WI-FI", section_style())));
-            lines.push(self.field_line(EditorField::Ssid));
-            lines.push(self.field_line(EditorField::Bssid));
-            lines.push(self.selection_line(
-                EditorField::Security,
-                match self.security {
-                    Security::Open => "None",
-                    Security::Psk => "WPA & WPA2 Personal",
-                    Security::Eap => "WPA & WPA2 Enterprise",
-                    Security::Unknown => "None",
-                },
+    fn form_rows(&self) -> Vec<(Option<EditorField>, Line<'static>)> {
+        let mut rows = vec![(None, Line::from(""))];
+        macro_rules! push_field {
+            ($field:expr, $line:expr $(,)?) => {
+                rows.push((Some($field), $line));
+            };
+        }
+        push_field!(
+            EditorField::ProfileName,
+            self.field_line(EditorField::ProfileName),
+        );
+        push_field!(EditorField::Device, self.field_line(EditorField::Device));
+        if let Some(kind) = self.creation_kind {
+            rows.push((None, Line::from("")));
+            rows.push((
+                None,
+                Line::from(Span::styled(
+                    format!(
+                        "- {} CREATION",
+                        match kind {
+                            InterfaceType::Wlan => "WI-FI",
+                            InterfaceType::Bridge => "BRIDGE",
+                            InterfaceType::Lagg => "LAGG",
+                            InterfaceType::Vlan => "VLAN",
+                            _ => "INTERFACE",
+                        }
+                    ),
+                    section_style(),
+                )),
             ));
+            match kind {
+                InterfaceType::Wlan => {
+                    push_field!(
+                        EditorField::CreationParent,
+                        self.field_line(EditorField::CreationParent),
+                    );
+                }
+                InterfaceType::Bridge | InterfaceType::Lagg => {
+                    if kind == InterfaceType::Lagg {
+                        push_field!(
+                            EditorField::CreationProtocol,
+                            self.selection_line(
+                                EditorField::CreationProtocol,
+                                Self::lagg_protocol_label(
+                                    self.creation_protocol,
+                                ),
+                            ),
+                        );
+                    }
+                    push_field!(
+                        EditorField::CreationMembers,
+                        self.field_line(EditorField::CreationMembers),
+                    );
+                }
+                InterfaceType::Vlan => {
+                    push_field!(
+                        EditorField::CreationParent,
+                        self.field_line(EditorField::CreationParent),
+                    );
+                    push_field!(
+                        EditorField::VlanTag,
+                        self.field_line(EditorField::VlanTag),
+                    );
+                }
+                _ => {}
+            }
+        }
+        if self.mode == EditorMode::Wifi {
+            rows.push((None, Line::from("")));
+            rows.push((
+                None,
+                Line::from(Span::styled("- WI-FI", section_style())),
+            ));
+            push_field!(EditorField::Ssid, self.field_line(EditorField::Ssid));
+            push_field!(
+                EditorField::Bssid,
+                self.field_line(EditorField::Bssid)
+            );
+            push_field!(
+                EditorField::Security,
+                self.selection_line(
+                    EditorField::Security,
+                    match self.security {
+                        Security::Open => "None",
+                        Security::Psk => "WPA & WPA2 Personal",
+                        Security::Eap => "WPA & WPA2 Enterprise",
+                        Security::Unknown => "None",
+                    },
+                ),
+            );
             if self.security == Security::Eap {
-                lines.push(self.field_line(EditorField::Identity));
+                push_field!(
+                    EditorField::Identity,
+                    self.field_line(EditorField::Identity),
+                );
             }
             if self.security != Security::Open {
-                lines.push(self.field_line(EditorField::Password));
+                push_field!(
+                    EditorField::Password,
+                    self.field_line(EditorField::Password),
+                );
             }
-            lines.push(self.checkbox_line(EditorField::Hidden));
+            push_field!(
+                EditorField::Hidden,
+                self.checkbox_line(EditorField::Hidden),
+            );
         } else {
-            lines.push(Line::from(Span::styled("- ETHERNET", section_style())));
+            rows.push((
+                None,
+                Line::from(Span::styled("- ETHERNET", section_style())),
+            ));
         }
 
-        lines.push(Line::from(""));
-        lines.push(
+        rows.push((None, Line::from("")));
+        push_field!(
+            EditorField::Ipv4Mode,
             self.selection_line(EditorField::Ipv4Mode, self.ipv4_mode.label()),
         );
-        lines.push(self.field_line(EditorField::Ipv4Address));
-        lines.push(self.field_line(EditorField::Ipv4Gateway));
-        lines.push(self.field_line(EditorField::Ipv4Dns));
-        lines.push(self.field_line(EditorField::Ipv4Search));
-        lines.push(
+        self.push_list_rows(&mut rows, ListField::Ipv4Addresses);
+        push_field!(
+            EditorField::Ipv4Gateway,
+            self.field_line(EditorField::Ipv4Gateway),
+        );
+        self.push_list_rows(&mut rows, ListField::Ipv4Dns);
+        self.push_list_rows(&mut rows, ListField::Ipv4Search);
+        push_field!(
+            EditorField::Ipv4Routing,
             self.routing_line(EditorField::Ipv4Routing, &self.ipv4_routes),
         );
-        lines.push(self.checkbox_line(EditorField::Ipv4NeverDefault));
-        lines.push(self.checkbox_line(EditorField::Ipv4IgnoreRoutes));
-        lines.push(self.checkbox_line(EditorField::Ipv4IgnoreDns));
-        lines.push(self.checkbox_line(EditorField::Ipv4Required));
+        for field in [
+            EditorField::Ipv4NeverDefault,
+            EditorField::Ipv4IgnoreRoutes,
+            EditorField::Ipv4IgnoreDns,
+            EditorField::Ipv4Required,
+        ] {
+            push_field!(field, self.checkbox_line(field));
+        }
 
-        lines.push(Line::from(""));
-        lines.push(
+        rows.push((None, Line::from("")));
+        push_field!(
+            EditorField::Ipv6Mode,
             self.selection_line(EditorField::Ipv6Mode, self.ipv6_mode.label()),
         );
-        lines.push(self.checkbox_line(EditorField::Slaac));
-        lines.push(self.field_line(EditorField::Ipv6Address));
-        lines.push(self.field_line(EditorField::Ipv6Gateway));
-        lines.push(self.field_line(EditorField::Ipv6Dns));
-        lines.push(self.field_line(EditorField::Ipv6Search));
-        lines.push(
+        push_field!(EditorField::Slaac, self.checkbox_line(EditorField::Slaac));
+        self.push_list_rows(&mut rows, ListField::Ipv6Addresses);
+        push_field!(
+            EditorField::Ipv6Gateway,
+            self.field_line(EditorField::Ipv6Gateway),
+        );
+        self.push_list_rows(&mut rows, ListField::Ipv6Dns);
+        self.push_list_rows(&mut rows, ListField::Ipv6Search);
+        push_field!(
+            EditorField::Ipv6Routing,
             self.routing_line(EditorField::Ipv6Routing, &self.ipv6_routes),
         );
-        lines.push(self.checkbox_line(EditorField::Ipv6NeverDefault));
-        lines.push(self.checkbox_line(EditorField::Ipv6IgnoreRoutes));
-        lines.push(self.checkbox_line(EditorField::Ipv6IgnoreDns));
-        lines.push(self.checkbox_line(EditorField::Ipv6Required));
-        lines
+        for field in [
+            EditorField::Ipv6NeverDefault,
+            EditorField::Ipv6IgnoreRoutes,
+            EditorField::Ipv6IgnoreDns,
+            EditorField::Ipv6Required,
+        ] {
+            push_field!(field, self.checkbox_line(field));
+        }
+        rows
+    }
+
+    fn form_scroll(
+        &self,
+        rows: &[(Option<EditorField>, Line<'static>)],
+        viewport_height: usize,
+    ) -> u16 {
+        let max_scroll = rows.len().saturating_sub(viewport_height);
+        let field = self.fields().get(self.focus).copied();
+        let focused_line = field
+            .and_then(|field| {
+                rows.iter()
+                    .position(|(row_field, _)| *row_field == Some(field))
+            })
+            .unwrap_or_else(|| rows.len().saturating_sub(1));
+        focused_line
+            .saturating_sub(viewport_height.saturating_sub(1))
+            .min(max_scroll) as u16
     }
 
     fn footer_lines(&self) -> Vec<Line<'static>> {
         let auto = if self.autoconnect { "X" } else { " " };
         let users = if self.available_users { "X" } else { " " };
+        let auto_style =
+            if !self.footer && self.focused(EditorField::Autoconnect) {
+                selected_style()
+            } else {
+                panel_style()
+            };
+        let users_style =
+            if !self.footer && self.focused(EditorField::AvailableUsers) {
+                selected_style()
+            } else {
+                panel_style()
+            };
         vec![
-            Line::from(format!("[{auto}] Automatically connect")),
-            Line::from(format!("[{users}] Available to all users")),
+            Line::from(Span::styled(
+                format!("[{auto}] Automatically connect"),
+                auto_style,
+            )),
+            Line::from(Span::styled(
+                format!("[{users}] Available to all users"),
+                users_style,
+            )),
             Line::from(vec![
                 Span::raw(" "),
                 button_span("Cancel", self.footer && self.footer_selected == 0),
@@ -1134,11 +1513,11 @@ impl ConnectionEditor {
         ]
     }
 
-    fn ipv4_value(&self) -> Result<Modification<PrefixedIpv4Addr>, String> {
-        match self.ipv4_mode {
-            IpMode::Automatic | IpMode::Ignore => Ok(Modification::Clear),
-            IpMode::Manual => {
-                let value = self.ipv4_address.trim();
+    fn ipv4_values(&self) -> Result<Vec<PrefixedIpv4Addr>, String> {
+        self.ipv4_addresses
+            .iter()
+            .map(|value| {
+                let value = value.trim();
                 let address: PrefixedIpv4Addr = serde_json::from_value(
                     serde_json::Value::String(value.to_string()),
                 )
@@ -1148,17 +1527,16 @@ impl ConnectionEditor {
                         "IPv4 prefix must be between 0 and 32".to_string()
                     );
                 }
-                Ok(Modification::Replace(address))
-            }
-        }
+                Ok(address)
+            })
+            .collect()
     }
 
-    fn ipv6_value(&self) -> Result<Modification<PrefixedIpv6Addr>, String> {
-        match self.ipv6_mode {
-            IpMode::Automatic => Ok(Modification::NoChange),
-            IpMode::Ignore => Ok(Modification::Clear),
-            IpMode::Manual => {
-                let value = self.ipv6_address.trim();
+    fn ipv6_values(&self) -> Result<Vec<PrefixedIpv6Addr>, String> {
+        self.ipv6_addresses
+            .iter()
+            .map(|value| {
+                let value = value.trim();
                 let address: PrefixedIpv6Addr = serde_json::from_value(
                     serde_json::Value::String(value.to_string()),
                 )
@@ -1168,23 +1546,156 @@ impl ConnectionEditor {
                         "IPv6 prefix must be between 0 and 128".to_string()
                     );
                 }
-                Ok(Modification::Replace(address))
+                Ok(address)
+            })
+            .collect()
+    }
+
+    fn ipv4_modifications(
+        &self,
+    ) -> Result<Vec<Modification<PrefixedIpv4Addr>>, String> {
+        match self.ipv4_mode {
+            IpMode::Automatic | IpMode::Ignore => Ok(vec![Modification::Clear]),
+            IpMode::Manual => {
+                let values = self.ipv4_values()?;
+                if values.is_empty() {
+                    return Err(
+                        "at least one IPv4 address is required in Manual mode"
+                            .to_string(),
+                    );
+                }
+                Ok(std::iter::once(Modification::Clear)
+                    .chain(values.into_iter().map(Modification::Append))
+                    .collect())
             }
         }
     }
 
-    fn interface_action(
+    fn ipv6_modifications(
+        &self,
+    ) -> Result<Vec<Modification<PrefixedIpv6Addr>>, String> {
+        match self.ipv6_mode {
+            IpMode::Automatic => Ok(vec![Modification::NoChange]),
+            IpMode::Ignore => Ok(vec![Modification::Clear]),
+            IpMode::Manual => {
+                let values = self.ipv6_values()?;
+                if values.is_empty() {
+                    return Err(
+                        "at least one IPv6 address is required in Manual mode"
+                            .to_string(),
+                    );
+                }
+                Ok(std::iter::once(Modification::Clear)
+                    .chain(values.into_iter().map(Modification::Append))
+                    .collect())
+            }
+        }
+    }
+
+    fn interface_actions(
         &self,
         name: String,
-    ) -> Result<InterfaceManagerAction, String> {
-        Ok(InterfaceManagerAction::ModLink {
-            name,
-            ipv4: self.ipv4_value()?,
-            ipv6: self.ipv6_value()?,
-            oper_state: Modification::NoChange,
-            slaac: Modification::Replace(self.slaac),
-            dhcpv4: Modification::Replace(self.ipv4_mode == IpMode::Automatic),
-        })
+    ) -> Result<Vec<InterfaceManagerAction>, String> {
+        let ipv4 = self.ipv4_modifications()?;
+        let ipv6 = self.ipv6_modifications()?;
+        let count = ipv4.len().max(ipv6.len());
+        Ok((0..count)
+            .map(|index| InterfaceManagerAction::ModLink {
+                name: name.clone(),
+                ipv4: ipv4
+                    .get(index)
+                    .cloned()
+                    .unwrap_or(Modification::NoChange),
+                ipv6: ipv6
+                    .get(index)
+                    .cloned()
+                    .unwrap_or(Modification::NoChange),
+                oper_state: Modification::NoChange,
+                slaac: if index == 0 {
+                    Modification::Replace(self.slaac)
+                } else {
+                    Modification::NoChange
+                },
+                dhcpv4: if index == 0 {
+                    Modification::Replace(self.ipv4_mode == IpMode::Automatic)
+                } else {
+                    Modification::NoChange
+                },
+            })
+            .collect())
+    }
+
+    fn creation_options(&self) -> Result<LinkOptions, String> {
+        let kind = self
+            .creation_kind
+            .ok_or_else(|| "connection is not a new interface".to_string())?;
+        match kind {
+            InterfaceType::Wlan => {
+                let parent = self.creation_parent.trim();
+                if parent.is_empty() {
+                    return Err(
+                        "a wireless parent device is required".to_string()
+                    );
+                }
+                Ok(LinkOptions::Wlan {
+                    parent: parent.to_string(),
+                    options: WlanLinkOptions::default(),
+                })
+            }
+            InterfaceType::Bridge => Ok(LinkOptions::Bridge {
+                members: self
+                    .creation_members
+                    .split(|character: char| {
+                        character == ',' || character.is_whitespace()
+                    })
+                    .filter(|member| !member.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+            }),
+            InterfaceType::Lagg => Ok(LinkOptions::Lagg {
+                protocol: self.creation_protocol,
+                members: self
+                    .creation_members
+                    .split(|character: char| {
+                        character == ',' || character.is_whitespace()
+                    })
+                    .filter(|member| !member.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+            }),
+            InterfaceType::Vlan => {
+                let parent = self.creation_parent.trim();
+                if parent.is_empty() {
+                    return Err("a VLAN parent device is required".to_string());
+                }
+                let tag = self
+                    .creation_vlan_tag
+                    .trim()
+                    .parse::<u16>()
+                    .map_err(|_| "VLAN ID must be a number".to_string())?;
+                if !(1..=4094).contains(&tag) {
+                    return Err(
+                        "VLAN ID must be between 1 and 4094".to_string()
+                    );
+                }
+                Ok(LinkOptions::Vlan {
+                    parent: parent.to_string(),
+                    tag,
+                })
+            }
+            _ => Err("this interface type cannot be created here".to_string()),
+        }
+    }
+
+    fn lagg_protocol_label(protocol: LaggProtocol) -> &'static str {
+        match protocol {
+            LaggProtocol::Failover => "failover",
+            LaggProtocol::Lacp => "lacp",
+            LaggProtocol::Loadbalance => "loadbalance",
+            LaggProtocol::Roundrobin => "roundrobin",
+            LaggProtocol::Broadcast => "broadcast",
+            LaggProtocol::None => "none",
+        }
     }
 
     fn wifi_values(
@@ -1453,6 +1964,7 @@ impl App {
             label: "Ethernet".to_string(),
             signal: None,
             target: None,
+            active: false,
         }];
         rows.extend(
             self.interfaces
@@ -1475,40 +1987,42 @@ impl App {
                     target: Some(ActivationTarget::Interface(
                         interface.name.clone(),
                     )),
+                    active: interface.state.is_online(),
                 }),
         );
         rows.push(ActivationRow {
             label: "Wi-Fi".to_string(),
             signal: None,
             target: None,
+            active: false,
         });
         if self.scan_results.is_empty() {
             rows.push(ActivationRow {
                 label: "  (no wireless networks found)".to_string(),
                 signal: None,
                 target: None,
+                active: false,
             });
         } else if let Some(iface) = self.first_wifi() {
             rows.extend(self.scan_results.iter().map(|network| {
+                let target = WifiTarget {
+                    iface: iface.clone(),
+                    ssid: network.ssid.clone(),
+                    bssid: Some(network.bssid),
+                    security: network.security,
+                    hidden: false,
+                };
+                let active = self.is_current_wifi_target(&target);
                 ActivationRow {
                     label: format!(
                         "  {}{}  {}",
-                        if self.is_current_wifi(network) {
-                            "* "
-                        } else {
-                            ""
-                        },
+                        if active { "* " } else { "" },
                         network.ssid,
                         network.security
                     ),
                     signal: Some(network.signal),
-                    target: Some(ActivationTarget::Wifi(WifiTarget {
-                        iface: iface.clone(),
-                        ssid: network.ssid.clone(),
-                        bssid: Some(network.bssid),
-                        security: network.security,
-                        hidden: false,
-                    })),
+                    target: Some(ActivationTarget::Wifi(target)),
+                    active,
                 }
             }));
         }
@@ -1516,20 +2030,15 @@ impl App {
             label: "Bluetooth".to_string(),
             signal: None,
             target: None,
+            active: false,
         });
         rows.push(ActivationRow {
             label: "  (no Bluetooth connections)".to_string(),
             signal: None,
             target: None,
+            active: false,
         });
         rows
-    }
-
-    fn is_current_wifi(&self, network: &ScanResult) -> bool {
-        self.wifi_status
-            .as_ref()
-            .and_then(|status| status.ssid.as_ref())
-            .is_some_and(|ssid| ssid == &network.ssid)
     }
 
     fn is_current_wifi_target(&self, target: &WifiTarget) -> bool {
@@ -1726,27 +2235,83 @@ impl App {
         });
     }
 
-    fn create_connection(&mut self, selected: usize) {
-        match selected {
-            0 => {
-                let Some(iface) = self.first_wifi() else {
+    fn next_interface_name(&self, prefix: &str) -> String {
+        let mut index = 0usize;
+        loop {
+            let name = format!("{prefix}{index}");
+            if !self
+                .interfaces
+                .iter()
+                .any(|interface| interface.name == name)
+            {
+                return name;
+            }
+            index += 1;
+        }
+    }
+
+    fn open_wifi_creation(&mut self, client: &mut DaemonClient) {
+        let command = DaemonCommand::InterfaceManager {
+            action: InterfaceManagerAction::GetWirelessDevices,
+        };
+        match self.request(client, &command) {
+            Ok(DaemonResponse::InterfaceManager {
+                response: InterfaceResponse::WirelessDevices(mut devices),
+            }) => {
+                devices.sort();
+                devices.dedup();
+                if devices.is_empty() {
                     self.show_message(
                         "New Wi-Fi connection",
-                        "No Wi-Fi interface is available",
+                        "No wireless device is available",
                     );
                     return;
-                };
+                }
+                self.popup = Popup::WirelessDevices(WirelessDevicePopup {
+                    devices,
+                    selected: 0,
+                    focus: WirelessDeviceFocus::List,
+                });
+            }
+            Ok(response) => self.show_error(
+                "New Wi-Fi connection",
+                format!("Wireless device query failed: {response:?}"),
+            ),
+            Err(error) => self.show_error(
+                "New Wi-Fi connection",
+                format!("Wireless device query failed: {error}"),
+            ),
+        }
+    }
+
+    fn create_connection(
+        &mut self,
+        client: &mut DaemonClient,
+        selected: usize,
+    ) {
+        match selected {
+            0 => self.open_wifi_creation(client),
+            1 | 3 => {
+                let name = self.next_interface_name("lagg");
                 self.popup = Popup::Editor(Box::new(
-                    ConnectionEditor::from_wifi(&iface, None, None),
+                    ConnectionEditor::from_new_link(InterfaceType::Lagg, &name),
                 ));
             }
-            _ => self.show_message(
-                "Connection type unavailable",
-                format!(
-                    "{} connections are not supported by this daemon yet",
-                    NEW_CONNECTION_TYPES[selected]
-                ),
-            ),
+            2 => {
+                let name = self.next_interface_name("bridge");
+                self.popup =
+                    Popup::Editor(Box::new(ConnectionEditor::from_new_link(
+                        InterfaceType::Bridge,
+                        &name,
+                    )));
+            }
+            4 => {
+                let name = self.next_interface_name("vlan");
+                self.popup = Popup::Editor(Box::new(
+                    ConnectionEditor::from_new_link(InterfaceType::Vlan, &name),
+                ));
+            }
+            _ => {}
         }
     }
 
@@ -1765,10 +2330,7 @@ impl App {
             );
             return;
         }
-        let up = !matches!(
-            interface.state,
-            ConnectionState::Connected | ConnectionState::Up
-        );
+        let up = !interface.state.is_online();
         let command = DaemonCommand::InterfaceManager {
             action: InterfaceManagerAction::ModLink {
                 name,
@@ -1787,10 +2349,12 @@ impl App {
 
     fn activate_selected(&mut self, client: &mut DaemonClient) {
         let rows = self.activation_rows();
-        let Some(target) = rows
-            .get(self.activation_selected)
-            .and_then(|row| row.target.clone())
-        else {
+        let selected =
+            self.activation_selected.min(rows.len().saturating_sub(1));
+        let Some(row) = rows.get(selected) else {
+            return;
+        };
+        let Some(target) = row.target.clone() else {
             return;
         };
         match target {
@@ -1798,7 +2362,7 @@ impl App {
                 self.interface_action(client, name)
             }
             ActivationTarget::Wifi(target) => {
-                if self.is_current_wifi_target(&target) {
+                if row.active {
                     self.disconnect_wifi(client, target.iface);
                 } else {
                     self.start_wifi(client, target, None);
@@ -1820,28 +2384,11 @@ impl App {
 
     fn activation_button_label(&self) -> &'static str {
         let rows = self.activation_rows();
-        match rows
-            .get(self.activation_selected)
-            .and_then(|row| row.target.as_ref())
-        {
-            Some(ActivationTarget::Interface(name))
-                if self.interfaces.iter().any(|interface| {
-                    interface.name == *name
-                        && matches!(
-                            interface.state,
-                            ConnectionState::Connected | ConnectionState::Up
-                        )
-                }) =>
-            {
-                "Deactivate"
-            }
-            Some(ActivationTarget::Wifi(target))
-                if self.is_current_wifi_target(target) =>
-            {
-                "Deactivate"
-            }
-            _ => "Activate",
-        }
+        let selected =
+            self.activation_selected.min(rows.len().saturating_sub(1));
+        rows.get(selected)
+            .filter(|row| row.target.is_some() && row.active)
+            .map_or("Activate", |_| "Deactivate")
     }
 
     fn start_wifi(
@@ -1920,24 +2467,54 @@ impl App {
                     );
                     return;
                 }
-                match editor.interface_action(name) {
-                    Ok(action) => {
-                        let command =
-                            DaemonCommand::InterfaceManager { action };
-                        match self.request(client, &command) {
-                            Ok(_) => {
-                                self.popup = Popup::None;
-                                self.refresh_interfaces(client);
-                            }
-                            Err(error) => {
-                                self.show_error("Save connection failed", error)
-                            }
+                let actions = match editor.interface_actions(name) {
+                    Ok(actions) => actions,
+                    Err(error) => {
+                        self.show_message("Invalid connection", error);
+                        return;
+                    }
+                };
+                if let Some(kind) = editor.creation_kind {
+                    let options = match editor.creation_options() {
+                        Ok(options) => options,
+                        Err(error) => {
+                            self.show_message("Invalid connection", error);
+                            return;
+                        }
+                    };
+                    let command = DaemonCommand::InterfaceManager {
+                        action: InterfaceManagerAction::AddLink {
+                            name: editor.device.trim().to_string(),
+                            kind,
+                            options: Some(options),
+                        },
+                    };
+                    match self.request(client, &command) {
+                        Ok(DaemonResponse::InterfaceManager {
+                            response: InterfaceResponse::Success(()),
+                        }) => {}
+                        Ok(response) => {
+                            self.show_error(
+                                "Create interface failed",
+                                format!("{response:?}"),
+                            );
+                            return;
+                        }
+                        Err(error) => {
+                            self.show_error("Create interface failed", error);
+                            return;
                         }
                     }
-                    Err(error) => {
-                        self.show_message("Invalid connection", error)
+                }
+                for action in actions {
+                    let command = DaemonCommand::InterfaceManager { action };
+                    if let Err(error) = self.request(client, &command) {
+                        self.show_error("Save connection failed", error);
+                        return;
                     }
                 }
+                self.popup = Popup::None;
+                self.refresh_interfaces(client);
             }
             EditorMode::Wifi => {
                 let (ssid, bssid, security) = match editor.wifi_values() {
@@ -1954,6 +2531,60 @@ impl App {
                         "Device must not be empty",
                     );
                     return;
+                }
+                let creation_actions = if editor.creation_kind.is_some() {
+                    Some(match editor.interface_actions(iface.clone()) {
+                        Ok(actions) => actions,
+                        Err(error) => {
+                            self.show_message("Invalid connection", error);
+                            return;
+                        }
+                    })
+                } else {
+                    None
+                };
+                if let Some(kind) = editor.creation_kind {
+                    let options = match editor.creation_options() {
+                        Ok(options) => options,
+                        Err(error) => {
+                            self.show_message("Invalid connection", error);
+                            return;
+                        }
+                    };
+                    let command = DaemonCommand::InterfaceManager {
+                        action: InterfaceManagerAction::AddLink {
+                            name: iface.clone(),
+                            kind,
+                            options: Some(options),
+                        },
+                    };
+                    match self.request(client, &command) {
+                        Ok(DaemonResponse::InterfaceManager {
+                            response: InterfaceResponse::Success(()),
+                        }) => {}
+                        Ok(response) => {
+                            self.show_error(
+                                "Create interface failed",
+                                format!("{response:?}"),
+                            );
+                            return;
+                        }
+                        Err(error) => {
+                            self.show_error("Create interface failed", error);
+                            return;
+                        }
+                    }
+                    self.refresh_interfaces(client);
+                    if !self.interfaces.iter().any(|interface| {
+                        interface.name == iface && interface.is_wlan()
+                    }) {
+                        self.show_message(
+                            "Create interface failed",
+                            format!("The daemon did not create {iface}"),
+                        );
+                        return;
+                    }
+                    self.wifi_iface = Some(iface.clone());
                 }
                 if let Some((old_ssid, old_bssid)) =
                     editor.existing_network.clone()
@@ -1979,18 +2610,33 @@ impl App {
                         password: if editor.password.is_empty() {
                             None
                         } else {
-                            Some(editor.password)
+                            Some(editor.password.clone())
                         },
                         identity: if editor.identity.is_empty() {
                             None
                         } else {
-                            Some(editor.identity)
+                            Some(editor.identity.clone())
                         },
                         hidden: editor.hidden,
                     },
                 };
                 match self.request(client, &add) {
                     Ok(_) => {
+                        if let Some(actions) = creation_actions {
+                            for action in actions {
+                                let command =
+                                    DaemonCommand::InterfaceManager { action };
+                                if let Err(error) =
+                                    self.request(client, &command)
+                                {
+                                    self.show_error(
+                                        "Save connection failed",
+                                        error,
+                                    );
+                                    return;
+                                }
+                            }
+                        }
                         self.popup = Popup::None;
                         self.refresh_wifi(client, false);
                     }
@@ -2083,20 +2729,7 @@ impl App {
                         self.edit_focus + 1
                     }
                 }
-                KeyCode::Tab => {
-                    self.edit_focus = if self.edit_focus == 4 {
-                        0
-                    } else {
-                        self.edit_focus + 1
-                    }
-                }
-                KeyCode::BackTab => {
-                    self.edit_focus = if self.edit_focus == 1 {
-                        0
-                    } else {
-                        self.edit_focus - 1
-                    }
-                }
+                KeyCode::Tab | KeyCode::BackTab => self.edit_focus = 0,
                 KeyCode::Enter => match self.edit_focus {
                     1 => self.open_new_connection(),
                     2 => self.open_edit(),
@@ -2138,20 +2771,7 @@ impl App {
                     self.activation_focus =
                         if self.activation_focus == 2 { 1 } else { 2 }
                 }
-                KeyCode::Tab => {
-                    self.activation_focus = if self.activation_focus == 2 {
-                        0
-                    } else {
-                        self.activation_focus + 1
-                    }
-                }
-                KeyCode::BackTab => {
-                    self.activation_focus = if self.activation_focus == 1 {
-                        0
-                    } else {
-                        self.activation_focus - 1
-                    }
-                }
+                KeyCode::Tab | KeyCode::BackTab => self.activation_focus = 0,
                 KeyCode::Enter => match self.activation_focus {
                     1 => self.activate_selected(client),
                     2 => self.screen = Screen::MainMenu,
@@ -2265,7 +2885,86 @@ impl App {
                     self.popup = Popup::None;
                 } else if let Some(selected) = create {
                     self.popup = Popup::None;
-                    self.create_connection(selected);
+                    self.create_connection(client, selected);
+                }
+            }
+            Popup::WirelessDevices(popup) => {
+                let mut parent = None;
+                let mut cancel = false;
+                match key {
+                    KeyCode::Up if popup.focus == WirelessDeviceFocus::List => {
+                        popup.selected = popup.selected.saturating_sub(1);
+                    }
+                    KeyCode::Down
+                        if popup.focus == WirelessDeviceFocus::List =>
+                    {
+                        popup.selected = (popup.selected + 1)
+                            .min(popup.devices.len().saturating_sub(1));
+                    }
+                    KeyCode::Tab => {
+                        popup.focus = match popup.focus {
+                            WirelessDeviceFocus::List => {
+                                WirelessDeviceFocus::Cancel
+                            }
+                            WirelessDeviceFocus::Cancel => {
+                                WirelessDeviceFocus::Select
+                            }
+                            WirelessDeviceFocus::Select => {
+                                WirelessDeviceFocus::List
+                            }
+                        };
+                    }
+                    KeyCode::BackTab => {
+                        popup.focus = match popup.focus {
+                            WirelessDeviceFocus::List => {
+                                WirelessDeviceFocus::Select
+                            }
+                            WirelessDeviceFocus::Cancel => {
+                                WirelessDeviceFocus::List
+                            }
+                            WirelessDeviceFocus::Select => {
+                                WirelessDeviceFocus::Cancel
+                            }
+                        };
+                    }
+                    KeyCode::Left | KeyCode::Right
+                        if matches!(
+                            popup.focus,
+                            WirelessDeviceFocus::Cancel
+                                | WirelessDeviceFocus::Select
+                        ) =>
+                    {
+                        popup.focus = match popup.focus {
+                            WirelessDeviceFocus::Cancel => {
+                                WirelessDeviceFocus::Select
+                            }
+                            WirelessDeviceFocus::Select => {
+                                WirelessDeviceFocus::Cancel
+                            }
+                            WirelessDeviceFocus::List => {
+                                WirelessDeviceFocus::List
+                            }
+                        };
+                    }
+                    KeyCode::Enter => match popup.focus {
+                        WirelessDeviceFocus::List => {
+                            popup.focus = WirelessDeviceFocus::Select
+                        }
+                        WirelessDeviceFocus::Cancel => cancel = true,
+                        WirelessDeviceFocus::Select => {
+                            parent = popup.devices.get(popup.selected).cloned();
+                        }
+                    },
+                    KeyCode::Esc => cancel = true,
+                    _ => {}
+                }
+                if cancel {
+                    self.popup = Popup::None;
+                } else if let Some(parent) = parent {
+                    let iface = self.next_interface_name("wlan");
+                    self.popup = Popup::Editor(Box::new(
+                        ConnectionEditor::from_new_wifi(&parent, &iface),
+                    ));
                 }
             }
             Popup::Password(popup) => {
@@ -2450,6 +3149,9 @@ impl App {
                     match key {
                         KeyCode::Up => editor.move_focus(-1),
                         KeyCode::Down => editor.move_focus(1),
+                        KeyCode::Left | KeyCode::Right => {
+                            editor.move_list_action()
+                        }
                         KeyCode::Tab => editor.tab_focus(false),
                         KeyCode::BackTab => editor.tab_focus(true),
                         KeyCode::Enter => {
@@ -2464,6 +3166,16 @@ impl App {
                                 .is_some()
                                 {
                                     editor.open_choice();
+                                } else if field.is_list_add() {
+                                    if let Some(kind) = field.list_kind() {
+                                        editor.add_list_value(kind);
+                                    }
+                                } else if editor.list_action
+                                    == ListAction::Remove
+                                    && let Some((kind, index)) =
+                                        field.list_value()
+                                {
+                                    editor.remove_list_value(kind, index);
                                 } else if field.is_bool() {
                                     editor.toggle(field);
                                 }
@@ -2561,6 +3273,9 @@ impl App {
             Popup::Message(popup) => self.draw_message(frame, area, popup),
             Popup::NewConnection(popup) => {
                 self.draw_new_connection(frame, area, popup)
+            }
+            Popup::WirelessDevices(popup) => {
+                self.draw_wireless_devices(frame, area, popup)
             }
             Popup::Password(popup) => self.draw_password(frame, area, popup),
             Popup::Connecting(popup) => {
@@ -2897,6 +3612,75 @@ impl App {
         );
     }
 
+    fn draw_wireless_devices(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        popup: &WirelessDevicePopup,
+    ) {
+        let rect = centered(area, 58, 14);
+        draw_frame(frame, rect, "Select Wi-Fi Device");
+        let body = inner(rect);
+        frame.render_widget(
+            Paragraph::new("Select the wireless device for the new interface.")
+                .style(panel_style()),
+            Rect {
+                x: body.x + 2,
+                y: body.y + 1,
+                width: body.width.saturating_sub(4),
+                height: 1,
+            },
+        );
+        let list_rect = Rect {
+            x: body.x + 2,
+            y: body.y + 3,
+            width: body.width.saturating_sub(4),
+            height: body.height.saturating_sub(6),
+        };
+        let items = popup
+            .devices
+            .iter()
+            .map(|device| ListItem::new(device.clone()))
+            .collect::<Vec<_>>();
+        let mut state = ListState::default();
+        if popup.focus == WirelessDeviceFocus::List {
+            state.select(Some(
+                popup.selected.min(popup.devices.len().saturating_sub(1)),
+            ));
+        }
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(
+                    Block::default().borders(Borders::ALL).style(panel_style()),
+                )
+                .highlight_style(selected_style())
+                .highlight_symbol(""),
+            list_rect,
+            &mut state,
+        );
+        let footer = Rect {
+            x: body.x + 2,
+            y: body.bottom().saturating_sub(2),
+            width: body.width.saturating_sub(4),
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                button_span(
+                    "Cancel",
+                    popup.focus == WirelessDeviceFocus::Cancel,
+                ),
+                Span::raw(" "),
+                button_span(
+                    "Select",
+                    popup.focus == WirelessDeviceFocus::Select,
+                ),
+            ]))
+            .alignment(Alignment::Right),
+            footer,
+        );
+    }
+
     fn draw_password(
         &self,
         frame: &mut Frame,
@@ -3015,7 +3799,7 @@ impl App {
         area: Rect,
         editor: &ConnectionEditor,
     ) {
-        let rect = centered(area, 80, 30);
+        let rect = centered(area, 64, 28);
         draw_frame(frame, rect, "Edit Connection");
         let body = inner(rect);
         let footer_height = 4;
@@ -3025,13 +3809,16 @@ impl App {
             width: body.width.saturating_sub(2),
             height: body.height.saturating_sub(footer_height),
         };
-        let form_lines = editor.form_lines();
-        let max_scroll =
-            form_lines.len().saturating_sub(content.height as usize) as u16;
+        let form_rows = editor.form_rows();
+        let scroll = editor.form_scroll(&form_rows, content.height as usize);
+        let form_lines = form_rows
+            .into_iter()
+            .map(|(_, line)| line)
+            .collect::<Vec<_>>();
         frame.render_widget(
             Paragraph::new(form_lines)
                 .style(panel_style())
-                .scroll((editor.scroll.min(max_scroll), 0)),
+                .scroll((scroll, 0)),
             content,
         );
         let footer = Rect {
@@ -3301,9 +4088,10 @@ fn signal_bars(signal: i32) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use libnetwork_daemon::ConnectionState;
     use ratatui::{Terminal, backend::TestBackend, style::Modifier};
     use std::{
-        io::Write,
+        io::{BufRead, BufReader, Write},
         os::unix::net::UnixListener,
         sync::atomic::{AtomicUsize, Ordering},
     };
@@ -3457,7 +4245,7 @@ mod tests {
     }
 
     #[test]
-    fn tab_cycles_list_and_button_regions_without_arrow_aliases() {
+    fn tab_switches_regions_and_arrows_move_vertical_buttons() {
         let mut main = App::default();
         let mut edit = App {
             screen: Screen::EditConnections,
@@ -3470,14 +4258,23 @@ mod tests {
         main.handle_key(crossterm::event::KeyCode::Tab, &mut client);
         assert_eq!(main.main_focus, 0);
 
-        for expected in [1, 2, 3, 4, 0] {
-            edit.handle_key(crossterm::event::KeyCode::Tab, &mut client);
-            assert_eq!(edit.edit_focus, expected);
-        }
         edit.handle_key(crossterm::event::KeyCode::Right, &mut client);
         assert_eq!(edit.edit_focus, 0);
         edit.handle_key(crossterm::event::KeyCode::Tab, &mut client);
+        assert_eq!(edit.edit_focus, 1);
+        edit.handle_key(crossterm::event::KeyCode::Right, &mut client);
+        assert_eq!(edit.edit_focus, 1);
+        edit.handle_key(crossterm::event::KeyCode::Down, &mut client);
+        assert_eq!(edit.edit_focus, 2);
+        edit.handle_key(crossterm::event::KeyCode::Down, &mut client);
+        assert_eq!(edit.edit_focus, 3);
+        edit.handle_key(crossterm::event::KeyCode::Down, &mut client);
+        assert_eq!(edit.edit_focus, 4);
         edit.handle_key(crossterm::event::KeyCode::Up, &mut client);
+        assert_eq!(edit.edit_focus, 3);
+        edit.handle_key(crossterm::event::KeyCode::Tab, &mut client);
+        assert_eq!(edit.edit_focus, 0);
+        edit.handle_key(crossterm::event::KeyCode::BackTab, &mut client);
         assert_eq!(edit.edit_focus, 4);
 
         let mut activate = App {
@@ -3486,30 +4283,35 @@ mod tests {
             activation_selected: 1,
             ..App::default()
         };
-        for expected in [1, 2, 0] {
-            activate.handle_key(crossterm::event::KeyCode::Tab, &mut client);
-            assert_eq!(activate.activation_focus, expected);
-        }
         activate.handle_key(crossterm::event::KeyCode::Left, &mut client);
         assert_eq!(activate.activation_focus, 0);
+        activate.handle_key(crossterm::event::KeyCode::Tab, &mut client);
+        assert_eq!(activate.activation_focus, 1);
+        activate.handle_key(crossterm::event::KeyCode::Right, &mut client);
+        assert_eq!(activate.activation_focus, 1);
+        activate.handle_key(crossterm::event::KeyCode::Down, &mut client);
+        assert_eq!(activate.activation_focus, 2);
+        activate.handle_key(crossterm::event::KeyCode::Up, &mut client);
+        assert_eq!(activate.activation_focus, 1);
+        activate.handle_key(crossterm::event::KeyCode::Tab, &mut client);
+        assert_eq!(activate.activation_focus, 0);
+        activate.handle_key(crossterm::event::KeyCode::BackTab, &mut client);
+        assert_eq!(activate.activation_focus, 2);
 
         let editor = ConnectionEditor::from_interface(&ethernet(
             "eth0",
             ConnectionState::Disconnected,
         ));
-        let last_field = editor.fields().len() - 1;
         let mut editor_app = App {
             screen: Screen::EditConnections,
             popup: Popup::Editor(Box::new(editor.clone())),
             ..App::default()
         };
-        for _ in 0..last_field {
-            editor_app.handle_key(crossterm::event::KeyCode::Tab, &mut client);
-        }
+        editor_app.handle_key(crossterm::event::KeyCode::Down, &mut client);
         let Popup::Editor(editor) = &editor_app.popup else {
             panic!("expected editor popup");
         };
-        assert_eq!(editor.focus, last_field);
+        assert_eq!(editor.focus, 1);
         assert!(!editor.footer);
         editor_app.handle_key(crossterm::event::KeyCode::Tab, &mut client);
         let Popup::Editor(editor) = &editor_app.popup else {
@@ -3517,13 +4319,18 @@ mod tests {
         };
         assert!(editor.footer);
         assert_eq!(editor.footer_selected, 0);
-        editor_app.handle_key(crossterm::event::KeyCode::Tab, &mut client);
+        editor_app.handle_key(crossterm::event::KeyCode::Right, &mut client);
+        let Popup::Editor(editor) = &editor_app.popup else {
+            panic!("expected editor popup");
+        };
+        assert!(editor.footer);
+        assert_eq!(editor.footer_selected, 1);
         editor_app.handle_key(crossterm::event::KeyCode::Tab, &mut client);
         let Popup::Editor(editor) = &editor_app.popup else {
             panic!("expected editor popup");
         };
         assert!(!editor.footer);
-        assert_eq!(editor.focus, 0);
+        assert_eq!(editor.focus, 1);
     }
 
     #[test]
@@ -3561,10 +4368,164 @@ mod tests {
         assert!(text.contains("Edit Connection"));
         assert!(text.contains("IPv4 CONFIGURATION"));
         assert!(text.contains("IPv6 CONFIGURATION"));
+        assert!(text.contains("Addresses"));
         assert!(text.contains("Accept IPv6 router advertisements"));
         assert!(text.contains("Automatically connect"));
         assert!(text.contains("<Cancel>"));
         assert!(text.contains("<OK>"));
+    }
+
+    #[test]
+    fn editor_list_controls_restore_multi_value_fields() {
+        let mut info = ethernet("em0", ConnectionState::Connected);
+        info.ipv4_addrs = vec![
+            serde_json::from_str("\"192.0.2.1/24\"").unwrap(),
+            serde_json::from_str("\"198.51.100.1/24\"").unwrap(),
+        ];
+        let mut editor = ConnectionEditor::from_interface(&info);
+        editor.ipv4_dns =
+            vec!["192.0.2.53".to_string(), "192.0.2.54".to_string()];
+        editor.ipv4_search = vec!["example.com".to_string()];
+
+        let fields = editor.fields();
+        assert!(
+            fields
+                .contains(
+                    &EditorField::ListValue(ListField::Ipv4Addresses, 1,)
+                )
+        );
+        assert!(
+            fields.contains(&EditorField::ListValue(ListField::Ipv4Dns, 1))
+        );
+        assert!(
+            fields.contains(&EditorField::ListValue(ListField::Ipv4Search, 0,))
+        );
+
+        let rows = editor.form_rows();
+        let text = rows
+            .iter()
+            .flat_map(|(_, line)| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(text.contains("Addresses"));
+        assert!(text.contains("192.0.2.1/24"));
+        assert!(text.contains("198.51.100.1/24"));
+        assert!(text.contains("192.0.2.53"));
+        assert!(text.contains("192.0.2.54"));
+        assert!(text.contains("example.com"));
+        assert_eq!(text.matches("<Remove>").count(), 5);
+
+        // Empty list fields contain only the Add action, never a padded blue
+        // text input or a Remove action.
+        assert!(fields.contains(&EditorField::ListAdd(ListField::Ipv6Dns)));
+        assert!(!fields.iter().any(|field| {
+            matches!(field, EditorField::ListValue(ListField::Ipv6Dns, _))
+        }));
+        assert!(
+            editor
+                .list_add_line(ListField::Ipv6Dns)
+                .spans
+                .iter()
+                .any(|span| span.content.contains("<Add...>"))
+        );
+    }
+
+    #[test]
+    fn editor_highlights_selected_text_and_supports_list_add_remove() {
+        let mut editor = ConnectionEditor::from_interface(&ethernet(
+            "eth0",
+            ConnectionState::Disconnected,
+        ));
+        editor.focus = editor
+            .fields()
+            .iter()
+            .position(|field| *field == EditorField::Device)
+            .unwrap();
+        assert!(
+            editor
+                .field_line(EditorField::Device)
+                .spans
+                .iter()
+                .any(|span| span.style.bg == Some(Color::Red))
+        );
+
+        editor.ipv4_dns = vec!["8.8.8.8".to_string()];
+        editor.focus = editor
+            .fields()
+            .iter()
+            .position(|field| {
+                *field == EditorField::ListValue(ListField::Ipv4Dns, 0)
+            })
+            .unwrap();
+        assert!(
+            editor
+                .list_value_line(ListField::Ipv4Dns, 0)
+                .spans
+                .iter()
+                .any(|span| span.style.bg == Some(Color::Red))
+        );
+        editor.move_list_action();
+        assert!(
+            editor
+                .list_value_line(ListField::Ipv4Dns, 0)
+                .spans
+                .iter()
+                .any(|span| {
+                    span.content.contains("<Remove>")
+                        && span.style.bg == Some(Color::Red)
+                })
+        );
+
+        editor.add_list_value(ListField::Ipv4Dns);
+        assert_eq!(editor.ipv4_dns, ["8.8.8.8", ""]);
+        editor.type_char('8');
+        editor.type_char('.');
+        editor.type_char('8');
+        assert_eq!(editor.ipv4_dns, ["8.8.8.8", "8.8"]);
+        editor.list_action = ListAction::Remove;
+        editor.remove_list_value(ListField::Ipv4Dns, 1);
+        assert_eq!(editor.ipv4_dns, ["8.8.8.8"]);
+        editor.remove_list_value(ListField::Ipv4Dns, 0);
+        assert!(editor.ipv4_dns.is_empty());
+        assert!(
+            editor
+                .fields()
+                .contains(&EditorField::ListAdd(ListField::Ipv4Dns))
+        );
+    }
+
+    #[test]
+    fn editor_saves_all_manual_addresses_without_dropping_values() {
+        let mut editor = ConnectionEditor::from_interface(&ethernet(
+            "eth0",
+            ConnectionState::Disconnected,
+        ));
+        editor.ipv4_mode = IpMode::Manual;
+        editor.ipv4_addresses =
+            vec!["192.0.2.1/24".to_string(), "198.51.100.1/24".to_string()];
+        let actions = editor.interface_actions("eth0".to_string()).unwrap();
+        assert_eq!(actions.len(), 3);
+        assert!(matches!(
+            actions[0],
+            InterfaceManagerAction::ModLink {
+                ipv4: Modification::Clear,
+                ..
+            }
+        ));
+        assert!(matches!(
+            actions[1],
+            InterfaceManagerAction::ModLink {
+                ipv4: Modification::Append(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            actions[2],
+            InterfaceManagerAction::ModLink {
+                ipv4: Modification::Append(_),
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -3573,18 +4534,23 @@ mod tests {
             "eth0",
             ConnectionState::Disconnected,
         ));
-        for _ in 0..16 {
+        let last_field = editor.fields().len() - 1;
+        for _ in 0..last_field {
             editor.move_focus(1);
         }
-        let down_scroll = editor.scroll;
+        let rows = editor.form_rows();
+        let down_scroll = editor.form_scroll(&rows, 22);
         assert!(down_scroll > 0);
 
-        editor.move_focus(-1);
-        assert!(editor.scroll < down_scroll);
+        for _ in 0..4 {
+            editor.move_focus(-1);
+        }
+        let up_scroll = editor.form_scroll(&editor.form_rows(), 22);
+        assert!(up_scroll < down_scroll);
 
         editor.move_focus(-100);
         assert_eq!(editor.focus, 0);
-        assert_eq!(editor.scroll, 0);
+        assert_eq!(editor.form_scroll(&editor.form_rows(), 22), 0);
     }
 
     #[test]
@@ -3598,7 +4564,16 @@ mod tests {
             .iter()
             .position(|field| *field == EditorField::Ipv4Routing)
             .unwrap();
-        editor.focus = routing_index;
+        for _ in 0..routing_index {
+            editor.move_focus(1);
+        }
+        assert_eq!(editor.fields()[editor.focus], EditorField::Ipv4Routing);
+        assert!(
+            editor
+                .form_rows()
+                .iter()
+                .any(|(field, _)| *field == Some(EditorField::Ipv4Routing))
+        );
 
         let app = App {
             screen: Screen::EditConnections,
@@ -3668,6 +4643,354 @@ mod tests {
     fn editor_validates_wifi_credentials() {
         let editor = ConnectionEditor::from_wifi("wlan0", None, None);
         assert!(editor.wifi_values().is_err());
+    }
+
+    #[test]
+    fn new_wifi_connection_selects_device_before_editing() {
+        let socket = std::env::temp_dir().join(format!(
+            "network-daemon-tui-wifi-{}-{}.sock",
+            std::process::id(),
+            NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&socket);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            writeln!(
+                stream,
+                r#"{{"subsystem":"Global","response":"Established"}}"#
+            )
+            .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+
+            reader.read_line(&mut line).unwrap();
+            let command: DaemonCommand = serde_json::from_str(&line).unwrap();
+            assert!(matches!(
+                command,
+                DaemonCommand::InterfaceManager {
+                    action: InterfaceManagerAction::GetWirelessDevices,
+                }
+            ));
+            let response = DaemonResponse::InterfaceManager {
+                response: InterfaceResponse::WirelessDevices(vec![
+                    "iwn0".to_string(),
+                ]),
+            };
+            writeln!(stream, "{}", serde_json::to_string(&response).unwrap())
+                .unwrap();
+        });
+
+        let mut client = DaemonClient::connect(&socket).unwrap();
+        let mut app = App::default();
+        app.create_connection(&mut client, 0);
+
+        let Popup::WirelessDevices(popup) = &app.popup else {
+            panic!("expected wireless-device popup");
+        };
+        assert_eq!(popup.devices, ["iwn0"]);
+        app.handle_key(crossterm::event::KeyCode::Enter, &mut client);
+        app.handle_key(crossterm::event::KeyCode::Enter, &mut client);
+        let Popup::Editor(editor) = &app.popup else {
+            panic!("expected Wi-Fi editor popup");
+        };
+        assert_eq!(editor.device, "wlan0");
+        assert_eq!(editor.creation_parent, "iwn0");
+        server.join().unwrap();
+        let _ = std::fs::remove_file(socket);
+    }
+
+    #[test]
+    fn new_logical_connections_open_editors_without_creating_early() {
+        let mut client = test_client();
+        for (selected, kind, prefix, field) in [
+            (
+                1,
+                InterfaceType::Lagg,
+                "lagg0",
+                EditorField::CreationMembers,
+            ),
+            (
+                2,
+                InterfaceType::Bridge,
+                "bridge0",
+                EditorField::CreationMembers,
+            ),
+            (4, InterfaceType::Vlan, "vlan0", EditorField::VlanTag),
+        ] {
+            let mut app = App::default();
+            app.create_connection(&mut client, selected);
+            let Popup::Editor(editor) = app.popup else {
+                panic!("expected creation editor for {kind:?}");
+            };
+            assert_eq!(editor.creation_kind, Some(kind));
+            assert_eq!(editor.device, prefix);
+            assert!(editor.fields().contains(&field));
+            if kind == InterfaceType::Lagg {
+                assert!(
+                    editor.fields().contains(&EditorField::CreationProtocol)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lagg_creation_persists_the_selected_protocol() {
+        let mut editor =
+            ConnectionEditor::from_new_link(InterfaceType::Lagg, "lagg0");
+        editor.creation_protocol = LaggProtocol::Lacp;
+        editor.creation_members = "eth0 eth1".to_string();
+        assert!(matches!(
+            editor.creation_options().unwrap(),
+            LinkOptions::Lagg {
+                protocol: LaggProtocol::Lacp,
+                members,
+            } if members == ["eth0".to_string(), "eth1".to_string()]
+        ));
+    }
+
+    #[test]
+    fn saving_bridge_creates_and_then_configures_the_interface() {
+        let socket = std::env::temp_dir().join(format!(
+            "network-daemon-tui-bridge-{}-{}.sock",
+            std::process::id(),
+            NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&socket);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            writeln!(
+                stream,
+                r#"{{"subsystem":"Global","response":"Established"}}"#
+            )
+            .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+
+            reader.read_line(&mut line).unwrap();
+            let command: DaemonCommand = serde_json::from_str(&line).unwrap();
+            assert!(matches!(
+                command,
+                DaemonCommand::InterfaceManager {
+                    action: InterfaceManagerAction::AddLink {
+                        name,
+                        kind: InterfaceType::Bridge,
+                        options: Some(LinkOptions::Bridge { members }),
+                    },
+                } if name == "bridge0"
+                    && members == ["eth0".to_string(), "eth1".to_string()]
+            ));
+            writeln!(
+                stream,
+                "{}",
+                serde_json::to_string(&DaemonResponse::InterfaceManager {
+                    response: InterfaceResponse::Success(()),
+                })
+                .unwrap()
+            )
+            .unwrap();
+
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            let command: DaemonCommand = serde_json::from_str(&line).unwrap();
+            assert!(matches!(
+                command,
+                DaemonCommand::InterfaceManager {
+                    action: InterfaceManagerAction::ModLink { .. },
+                }
+            ));
+            writeln!(
+                stream,
+                "{}",
+                serde_json::to_string(&DaemonResponse::InterfaceManager {
+                    response: InterfaceResponse::Success(()),
+                })
+                .unwrap()
+            )
+            .unwrap();
+
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            let command: DaemonCommand = serde_json::from_str(&line).unwrap();
+            assert!(matches!(
+                command,
+                DaemonCommand::InterfaceManager {
+                    action: InterfaceManagerAction::GetAllInterfaces,
+                }
+            ));
+            writeln!(
+                stream,
+                "{}",
+                serde_json::to_string(&DaemonResponse::InterfaceManager {
+                    response: InterfaceResponse::InfoList(Vec::new()),
+                })
+                .unwrap()
+            )
+            .unwrap();
+        });
+
+        let mut client = DaemonClient::connect(&socket).unwrap();
+        let mut editor =
+            ConnectionEditor::from_new_link(InterfaceType::Bridge, "bridge0");
+        editor.creation_members = "eth0, eth1".to_string();
+        let mut app = App::default();
+        app.save_editor(&mut client, editor);
+        assert!(matches!(app.popup, Popup::None));
+        server.join().unwrap();
+        let _ = std::fs::remove_file(socket);
+    }
+
+    #[test]
+    fn saving_new_wifi_creates_the_selected_parent_interface() {
+        let socket = std::env::temp_dir().join(format!(
+            "network-daemon-tui-new-wifi-{}-{}.sock",
+            std::process::id(),
+            NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&socket);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            writeln!(
+                stream,
+                r#"{{"subsystem":"Global","response":"Established"}}"#
+            )
+            .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+
+            reader.read_line(&mut line).unwrap();
+            let command: DaemonCommand = serde_json::from_str(&line).unwrap();
+            assert!(matches!(
+                command,
+                DaemonCommand::InterfaceManager {
+                    action: InterfaceManagerAction::GetWirelessDevices,
+                }
+            ));
+            writeln!(
+                stream,
+                "{}",
+                serde_json::to_string(&DaemonResponse::InterfaceManager {
+                    response: InterfaceResponse::WirelessDevices(vec![
+                        "iwn0".to_string(),
+                    ]),
+                })
+                .unwrap()
+            )
+            .unwrap();
+
+            let mut next_command = || {
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                serde_json::from_str::<DaemonCommand>(&line).unwrap()
+            };
+            assert!(matches!(
+                next_command(),
+                DaemonCommand::InterfaceManager {
+                    action: InterfaceManagerAction::AddLink {
+                        name,
+                        kind: InterfaceType::Wlan,
+                        options: Some(LinkOptions::Wlan { parent, .. }),
+                    },
+                } if name == "wlan0" && parent == "iwn0"
+            ));
+            let success = || DaemonResponse::InterfaceManager {
+                response: InterfaceResponse::Success(()),
+            };
+            writeln!(stream, "{}", serde_json::to_string(&success()).unwrap())
+                .unwrap();
+
+            assert!(matches!(
+                next_command(),
+                DaemonCommand::InterfaceManager {
+                    action: InterfaceManagerAction::GetAllInterfaces,
+                }
+            ));
+            let mut wlan = InterfaceInfo::new(7, "wlan0");
+            wlan.interface_type = InterfaceType::Wlan;
+            writeln!(
+                stream,
+                "{}",
+                serde_json::to_string(&DaemonResponse::InterfaceManager {
+                    response: InterfaceResponse::InfoList(vec![wlan]),
+                })
+                .unwrap()
+            )
+            .unwrap();
+
+            assert!(matches!(
+                next_command(),
+                DaemonCommand::WiFiManager {
+                    iface,
+                    action: WiFiManagerAction::AddNetwork { ssid, .. },
+                } if iface == "wlan0" && ssid == "Cafe"
+            ));
+            writeln!(
+                stream,
+                "{}",
+                serde_json::to_string(&DaemonResponse::WiFiManager {
+                    iface: "wlan0".to_string(),
+                    response: WiFiManagerResponse::Success(()),
+                })
+                .unwrap()
+            )
+            .unwrap();
+
+            assert!(matches!(
+                next_command(),
+                DaemonCommand::InterfaceManager {
+                    action: InterfaceManagerAction::ModLink { .. },
+                }
+            ));
+            writeln!(stream, "{}", serde_json::to_string(&success()).unwrap())
+                .unwrap();
+
+            for response in [
+                DaemonResponse::WiFiManager {
+                    iface: "wlan0".to_string(),
+                    response: WiFiManagerResponse::ScanResults(Vec::new()),
+                },
+                DaemonResponse::WiFiManager {
+                    iface: "wlan0".to_string(),
+                    response: WiFiManagerResponse::Status(
+                        SupplicantStatus::default(),
+                    ),
+                },
+                DaemonResponse::WiFiManager {
+                    iface: "wlan0".to_string(),
+                    response: WiFiManagerResponse::KnownNetworks(Vec::new()),
+                },
+            ] {
+                assert!(matches!(
+                    next_command(),
+                    DaemonCommand::WiFiManager { .. }
+                ));
+                writeln!(
+                    stream,
+                    "{}",
+                    serde_json::to_string(&response).unwrap()
+                )
+                .unwrap();
+            }
+        });
+
+        let mut client = DaemonClient::connect(&socket).unwrap();
+        let mut app = App::default();
+        app.create_connection(&mut client, 0);
+        app.handle_key(crossterm::event::KeyCode::Enter, &mut client);
+        app.handle_key(crossterm::event::KeyCode::Enter, &mut client);
+        let Popup::Editor(editor) =
+            std::mem::replace(&mut app.popup, Popup::None)
+        else {
+            panic!("expected Wi-Fi editor popup");
+        };
+        let mut editor = *editor;
+        editor.ssid = "Cafe".to_string();
+        app.save_editor(&mut client, editor);
+        assert!(matches!(app.popup, Popup::None));
+        server.join().unwrap();
+        let _ = std::fs::remove_file(socket);
     }
 
     #[test]

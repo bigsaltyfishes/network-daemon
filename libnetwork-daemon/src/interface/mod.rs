@@ -16,12 +16,14 @@ pub enum InterfaceResponse {
     Success(()),
     Info(InterfaceInfo),
     InfoList(Vec<InterfaceInfo>),
+    /// FreeBSD wireless parent devices that can host cloned WLAN links.
+    WirelessDevices(Vec<String>),
     Event(InterfaceManagerEvent),
     #[serde(skip)]
     EventReceiver(Receiver<InterfaceManagerEvent>),
 }
 
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type")]
 pub enum LinkOptions {
     Wlan {
@@ -29,6 +31,42 @@ pub enum LinkOptions {
         #[serde(default)]
         options: WlanLinkOptions,
     },
+    /// A FreeBSD bridge and its optional member interfaces.
+    Bridge {
+        #[serde(default)]
+        members: Vec<String>,
+    },
+    /// A FreeBSD lagg interface (Bond/Team in the TUI) and its ports.
+    Lagg {
+        #[serde(default)]
+        protocol: LaggProtocol,
+        #[serde(default)]
+        members: Vec<String>,
+    },
+    /// A VLAN interface bound to a parent link.
+    Vlan { parent: String, tag: u16 },
+}
+
+#[derive(
+    Default,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum LaggProtocol {
+    #[default]
+    Failover,
+    Lacp,
+    Loadbalance,
+    Roundrobin,
+    Broadcast,
+    None,
 }
 
 #[derive(
@@ -129,13 +167,19 @@ pub enum InterfaceManagerAction {
     ///
     /// Sends `InterfaceResponse::InfoList(Vec<InterfaceInfo>)` on completion
     GetInterfacesByState { state: ConnectionState },
+    /// Get the detected FreeBSD wireless parent devices.
+    ///
+    /// # Response
+    ///
+    /// Sends `InterfaceResponse::WirelessDevices(Vec<String>)` on completion
+    GetWirelessDevices,
     /// Subscribe to interface manager events
     ///
     /// # Response
     ///
     /// Sends `InterfaceResponse::EventReceiver(Receiver<InterfaceManagerEvent>)` on completion
     SubscribeEvents,
-    /// Add a new interface (Bridge or Wlan)
+    /// Add a new logical interface and apply its link-specific parameters.
     ///
     /// # Response
     ///
@@ -143,7 +187,8 @@ pub enum InterfaceManagerAction {
     AddLink {
         name: String,
         kind: InterfaceType,
-        /// Required for Wlan
+        /// Creation parameters. For Wlan, omitting this lets the daemon choose
+        /// the first detected wireless device and default station-mode options.
         options: Option<LinkOptions>,
     },
     /// Delete an interface
