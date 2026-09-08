@@ -1049,7 +1049,7 @@ dependencies = [
  "futures-lite",
  "futures-util",
  "kameo",
- "netlink-packet-core 0.9.0",
+ "netlink-packet-core",
  "schemars",
  "serde",
  "serde_json",
@@ -1145,10 +1145,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "netlink-packet-core"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d6e2daf9a8c2e21302714706860a0e6be02e03d17294ecc66b354ea7d4059dd"
+name = "netlink-packet-route"
+version = "0.29.0"
+dependencies = [
+ "bitflags 2.10.0",
+ "libc",
+ "log",
+ "netlink-packet-core",
+]
 
 [[package]]
 name = "netlink-packet-route"
@@ -1159,18 +1163,7 @@ dependencies = [
  "bitflags 2.10.0",
  "libc",
  "log",
- "netlink-packet-core 0.8.1",
-]
-
-[[package]]
-name = "netlink-packet-route"
-version = "0.33.0"
-dependencies = [
- "bitflags 2.10.0",
- "libc",
- "log",
- "netlink-packet-core 0.9.0",
- "zerocopy",
+ "netlink-packet-core",
 ]
 
 [[package]]
@@ -1200,8 +1193,8 @@ dependencies = [
  "kameo",
  "libc",
  "libnetwork-daemon",
- "netlink-packet-core 0.9.0",
- "netlink-packet-route 0.33.0",
+ "netlink-packet-core",
+ "netlink-packet-route 0.29.0",
  "nix",
  "pcap",
  "rand",
@@ -1571,7 +1564,7 @@ dependencies = [
  "async-io",
  "flume",
  "libc",
- "netlink-packet-core 0.8.1",
+ "netlink-packet-core",
  "netlink-packet-route 0.31.0",
  "netlink-sys",
  "tokio",

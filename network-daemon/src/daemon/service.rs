@@ -443,8 +443,12 @@ where
                                 );
                             }
                         }
-                    } else if info.state == ConnectionState::Up
-                        && !self.dhcp_supervisors.contains_key(&info.name)
+                    } else if matches!(
+                        info.state,
+                        ConnectionState::Up | ConnectionState::Connected
+                    ) && !self
+                        .dhcp_supervisors
+                        .contains_key(&info.name)
                         && let Some(mac) = info.mac_addr
                     {
                         let iface_name = info.name.clone();

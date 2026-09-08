@@ -267,10 +267,12 @@ impl Message<InterfaceManagerAction> for InterfaceManager {
                 ipv6,
                 oper_state,
                 slaac,
+                dhcpv4,
             } => {
                 async fn mod_ip<T>(
-                    info: &InterfaceInfo,
+                    ifindex: u32,
                     modification: Modification<T>,
+                    current_addresses: &[PrefixedIpAddr],
                 ) -> Result<(), InterfaceError>
                 where
                     T: Into<PrefixedIpAddr>,
@@ -279,26 +281,26 @@ impl Message<InterfaceManagerAction> for InterfaceManager {
                         .map_err(|e| InterfaceError::Other(e.to_string()))?;
                     match modification {
                         Modification::Remove(ip) => {
-                            modifier.del_address(info.id, ip.into()).await?;
+                            modifier.del_address(ifindex, ip.into()).await?;
                         }
                         Modification::Append(ip) => {
-                            modifier.add_address(info.id, ip.into()).await?;
+                            modifier.add_address(ifindex, ip.into()).await?;
                         }
                         Modification::Clear => {
-                            for addr in info.ipv4_addrs.iter() {
+                            for addr in current_addresses {
                                 modifier
-                                    .del_address(info.id, addr.clone().into())
+                                    .del_address(ifindex, addr.clone())
                                     .await?;
                             }
                         }
                         Modification::Replace(ip) => {
-                            for addr in info.ipv4_addrs.iter() {
+                            for addr in current_addresses {
                                 modifier
-                                    .del_address(info.id, addr.clone().into())
+                                    .del_address(ifindex, addr.clone())
                                     .await?;
                             }
 
-                            modifier.add_address(info.id, ip.into()).await?;
+                            modifier.add_address(ifindex, ip.into()).await?;
                         }
                         Modification::NoChange => {}
                     }
@@ -313,8 +315,20 @@ impl Message<InterfaceManagerAction> for InterfaceManager {
                     }
                 };
 
-                mod_ip(&info, ipv4).await?;
-                mod_ip(&info, ipv6).await?;
+                let ipv4_addresses = info
+                    .ipv4_addrs
+                    .iter()
+                    .cloned()
+                    .map(Into::into)
+                    .collect::<Vec<PrefixedIpAddr>>();
+                let ipv6_addresses = info
+                    .ipv6_addrs
+                    .iter()
+                    .cloned()
+                    .map(Into::into)
+                    .collect::<Vec<PrefixedIpAddr>>();
+                mod_ip(info.id, ipv4, &ipv4_addresses).await?;
+                mod_ip(info.id, ipv6, &ipv6_addresses).await?;
 
                 if let Modification::Replace(state) = oper_state {
                     let ifconfig = Ifconfig::new();
@@ -330,6 +344,19 @@ impl Message<InterfaceManagerAction> for InterfaceManager {
                         info.slaac_enabled = state;
                         self.add_interface(info);
                     }
+                }
+
+                if let Modification::Replace(enabled) = dhcpv4
+                    && let Some(mut info) = self.get_interface(&name)
+                    && info.dhcpv4_enabled != enabled
+                {
+                    info.dhcpv4_enabled = enabled;
+                    self.add_interface(info.clone());
+                    self.event_broadcaster
+                        .broadcast(InterfaceManagerEvent::InterfaceChanged(
+                            info,
+                        ))
+                        .await;
                 }
                 Ok(InterfaceResponse::Success(()))
             }
@@ -441,6 +468,8 @@ impl Message<InterfaceManagerAction> for InterfaceManager {
                                 current_info.gateway_ipv4.clone();
                             info.gateway_ipv6 =
                                 current_info.gateway_ipv6.clone();
+                            info.dhcpv4_enabled = current_info.dhcpv4_enabled;
+                            info.slaac_enabled = current_info.slaac_enabled;
                         }
 
                         self.table.update(info.clone());

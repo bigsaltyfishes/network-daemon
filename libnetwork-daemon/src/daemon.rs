@@ -31,6 +31,8 @@ pub enum GlobalDaemonResponse {
     WiFiInterfaceNotFound { iface: String },
     /// General error response
     Error { message: String },
+    /// Current or newly applied system hostname.
+    Hostname(String),
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -54,4 +56,30 @@ pub enum DaemonResponse {
 pub enum GlobalDaemonAction {
     /// Shutdown current connection
     Shutdown,
+    /// Read the system hostname.
+    GetHostname,
+    /// Apply a new system hostname.
+    SetHostname { name: String },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hostname_actions_round_trip() {
+        let command = DaemonCommand::Global {
+            action: GlobalDaemonAction::SetHostname {
+                name: "router".to_string(),
+            },
+        };
+        let encoded = serde_json::to_string(&command).unwrap();
+        let decoded: DaemonCommand = serde_json::from_str(&encoded).unwrap();
+        assert!(matches!(
+            decoded,
+            DaemonCommand::Global {
+                action: GlobalDaemonAction::SetHostname { .. }
+            }
+        ));
+    }
 }

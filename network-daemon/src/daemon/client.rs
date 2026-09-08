@@ -1,3 +1,5 @@
+use std::ffi::CString;
+
 use async_net::unix::UnixStream;
 use futures_lite::{
     AsyncBufReadExt, AsyncWriteExt,
@@ -158,6 +160,39 @@ where
                                 error!("Failed to send shutdown ack: {}", e);
                             }
                             ctx.stop();
+                        }
+                        GlobalDaemonAction::GetHostname => {
+                            let response = match Self::read_hostname() {
+                                Ok(name) => {
+                                    GlobalDaemonResponse::Hostname(name)
+                                }
+                                Err(e) => GlobalDaemonResponse::Error {
+                                    message: format!(
+                                        "failed to read system hostname: {e}"
+                                    ),
+                                },
+                            };
+                            let ret = DaemonResponse::Global { response };
+                            let resp = serde_json::to_string(&ret).unwrap();
+                            if let Err(e) = self.writer.tell(resp).await {
+                                error!("Failed to send hostname: {}", e);
+                            }
+                        }
+                        GlobalDaemonAction::SetHostname { name } => {
+                            let response = match Self::write_hostname(&name) {
+                                Ok(()) => GlobalDaemonResponse::Hostname(name),
+                                Err(message) => {
+                                    GlobalDaemonResponse::Error { message }
+                                }
+                            };
+                            let ret = DaemonResponse::Global { response };
+                            let resp = serde_json::to_string(&ret).unwrap();
+                            if let Err(e) = self.writer.tell(resp).await {
+                                error!(
+                                    "Failed to send hostname response: {}",
+                                    e
+                                );
+                            }
                         }
                     },
                     DaemonCommand::WiFiManager { iface, action } => {
@@ -458,6 +493,44 @@ impl<W> ClientHandler<W>
 where
     W: WifiManagerBackend,
 {
+    /// Read the live kernel hostname for the hostname activity.
+    fn read_hostname() -> Result<String, std::io::Error> {
+        let mut buffer = [0u8; 256];
+        let result = unsafe {
+            libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len())
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let length = buffer
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(buffer.len());
+        Ok(String::from_utf8_lossy(&buffer[..length]).into_owned())
+    }
+
+    /// Apply a validated hostname to the live kernel.
+    fn write_hostname(name: &str) -> Result<(), String> {
+        if name.is_empty() {
+            return Err("hostname must not be empty".to_string());
+        }
+        if name.len() > 255 {
+            return Err("hostname must be at most 255 bytes".to_string());
+        }
+        let c_name = CString::new(name)
+            .map_err(|_| "hostname must not contain NUL".to_string())?;
+        let length = libc::c_int::try_from(name.len())
+            .map_err(|_| "hostname length is out of range".to_string())?;
+        let result = unsafe { libc::sethostname(c_name.as_ptr(), length) };
+        if result != 0 {
+            return Err(format!(
+                "failed to set system hostname: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(())
+    }
+
     /// Persist a known network: metadata to config.toml, credential to SQLite.
     async fn persist_network(
         &self,

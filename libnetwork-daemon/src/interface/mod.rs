@@ -167,6 +167,9 @@ pub enum InterfaceManagerAction {
         oper_state: Modification<bool>,
         #[serde(default)]
         slaac: Modification<bool>,
+        /// Enable or disable the daemon's DHCPv4 supervisor.
+        #[serde(default)]
+        dhcpv4: Modification<bool>,
     },
     /// DHCP Set event for an interface
     ///

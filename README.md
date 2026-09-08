@@ -57,8 +57,10 @@ cargo build -p network-manager-tui
 sudo -u $USER ./target/debug/network-manager-tui
 ```
 
-Keys: `i` interfaces · `w` Wi-Fi scan results · `n` known networks ·
-`s` scan · `c` connect · `r` refresh · `q` quit.
+The TUI starts at the nmtui-style activity picker. Use the arrow keys and
+Enter to choose an activity; Esc returns to the previous screen. In the
+connection activation list, `r` rescans Wi-Fi. The editor supports Tab/arrow
+navigation, Space for checkboxes, and `<Cancel>`/`<OK>` actions.
 
 If you get `Permission denied`, it means your session doesn't yet have the
 `network` group (re-login) — the daemon is working correctly.
