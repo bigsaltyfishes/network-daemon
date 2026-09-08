@@ -169,6 +169,7 @@ enum EditorField {
     Ipv4Gateway,
     Ipv4Dns,
     Ipv4Search,
+    Ipv4Routing,
     Ipv4NeverDefault,
     Ipv4IgnoreRoutes,
     Ipv4IgnoreDns,
@@ -179,6 +180,7 @@ enum EditorField {
     Ipv6Gateway,
     Ipv6Dns,
     Ipv6Search,
+    Ipv6Routing,
     Ipv6NeverDefault,
     Ipv6IgnoreRoutes,
     Ipv6IgnoreDns,
@@ -188,6 +190,10 @@ enum EditorField {
 }
 
 impl EditorField {
+    fn is_routing(self) -> bool {
+        matches!(self, Self::Ipv4Routing | Self::Ipv6Routing)
+    }
+
     fn is_text(self) -> bool {
         matches!(
             self,
@@ -234,6 +240,176 @@ struct ChoicePopup {
     selected: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoutingFamily {
+    Ipv4,
+    Ipv6,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoutingFocus {
+    List,
+    Add,
+    Delete,
+    Cancel,
+    Ok,
+}
+
+impl RoutingFocus {
+    fn index(self) -> usize {
+        match self {
+            Self::List => 0,
+            Self::Add => 1,
+            Self::Delete => 2,
+            Self::Cancel => 3,
+            Self::Ok => 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RoutingPopup {
+    family: RoutingFamily,
+    routes: Vec<String>,
+    selected: usize,
+    focus: RoutingFocus,
+    editing: bool,
+    input: String,
+    error: Option<String>,
+}
+
+impl RoutingPopup {
+    fn new(family: RoutingFamily, routes: Vec<String>) -> Self {
+        Self {
+            family,
+            routes,
+            selected: 0,
+            focus: RoutingFocus::List,
+            editing: false,
+            input: String::new(),
+            error: None,
+        }
+    }
+
+    fn title(&self) -> &'static str {
+        match self.family {
+            RoutingFamily::Ipv4 => "Edit IPv4 Routes",
+            RoutingFamily::Ipv6 => "Edit IPv6 Routes",
+        }
+    }
+
+    fn placeholder(&self) -> &'static str {
+        "destination/prefix gateway"
+    }
+
+    fn begin_add(&mut self) {
+        self.editing = true;
+        self.input.clear();
+        self.error = None;
+    }
+
+    fn add_route(&mut self) -> Result<(), String> {
+        let mut parts = self.input.split_whitespace();
+        let destination = parts.next().unwrap_or_default();
+        let gateway = parts.next();
+        if destination.is_empty() {
+            return Err("Route must not be empty".to_string());
+        }
+        if parts.next().is_some() {
+            return Err(
+                "Route accepts one destination and one gateway".to_string()
+            );
+        }
+        match self.family {
+            RoutingFamily::Ipv4 => {
+                let address: PrefixedIpv4Addr = serde_json::from_value(
+                    serde_json::Value::String(destination.to_string()),
+                )
+                .map_err(|_| "Invalid IPv4 destination/prefix".to_string())?;
+                if address.prefix_len > 32 {
+                    return Err(
+                        "IPv4 prefix must be between 0 and 32".to_string()
+                    );
+                }
+                if let Some(gateway) = gateway {
+                    gateway
+                        .parse::<std::net::Ipv4Addr>()
+                        .map_err(|_| "Invalid IPv4 gateway".to_string())?;
+                }
+            }
+            RoutingFamily::Ipv6 => {
+                let address: PrefixedIpv6Addr = serde_json::from_value(
+                    serde_json::Value::String(destination.to_string()),
+                )
+                .map_err(|_| "Invalid IPv6 destination/prefix".to_string())?;
+                if address.prefix_len > 128 {
+                    return Err(
+                        "IPv6 prefix must be between 0 and 128".to_string()
+                    );
+                }
+                if let Some(gateway) = gateway {
+                    gateway
+                        .parse::<std::net::Ipv6Addr>()
+                        .map_err(|_| "Invalid IPv6 gateway".to_string())?;
+                }
+            }
+        }
+        self.routes.push(self.input.trim().to_string());
+        self.selected = self.routes.len().saturating_sub(1);
+        self.editing = false;
+        self.input.clear();
+        self.error = None;
+        Ok(())
+    }
+
+    fn delete_selected(&mut self) {
+        if self.routes.is_empty() {
+            return;
+        }
+        self.routes.remove(self.selected);
+        self.selected = self.selected.min(self.routes.len().saturating_sub(1));
+    }
+
+    fn move_cursor(&mut self, delta: isize) {
+        match self.focus {
+            RoutingFocus::List => {
+                if !self.routes.is_empty() {
+                    self.selected = (self.selected as isize + delta)
+                        .rem_euclid(self.routes.len() as isize)
+                        as usize;
+                }
+            }
+            _ => {
+                let order = [
+                    RoutingFocus::Add,
+                    RoutingFocus::Delete,
+                    RoutingFocus::Cancel,
+                    RoutingFocus::Ok,
+                ];
+                let current = self.focus.index().saturating_sub(1);
+                self.focus = order[(current as isize + delta)
+                    .rem_euclid(order.len() as isize)
+                    as usize];
+            }
+        }
+    }
+
+    fn tab(&mut self, backwards: bool) {
+        let order = [
+            RoutingFocus::List,
+            RoutingFocus::Add,
+            RoutingFocus::Delete,
+            RoutingFocus::Cancel,
+            RoutingFocus::Ok,
+        ];
+        let current = self.focus.index();
+        let delta = if backwards { -1 } else { 1 };
+        self.focus = order[(current as isize + delta)
+            .rem_euclid(order.len() as isize)
+            as usize];
+    }
+}
+
 /// Connection editor data and focus state.
 #[derive(Debug, Clone)]
 pub struct ConnectionEditor {
@@ -251,6 +427,7 @@ pub struct ConnectionEditor {
     ipv4_gateway: String,
     ipv4_dns: String,
     ipv4_search: String,
+    ipv4_routes: Vec<String>,
     ipv4_never_default: bool,
     ipv4_ignore_routes: bool,
     ipv4_ignore_dns: bool,
@@ -261,6 +438,7 @@ pub struct ConnectionEditor {
     ipv6_gateway: String,
     ipv6_dns: String,
     ipv6_search: String,
+    ipv6_routes: Vec<String>,
     ipv6_never_default: bool,
     ipv6_ignore_routes: bool,
     ipv6_ignore_dns: bool,
@@ -272,6 +450,7 @@ pub struct ConnectionEditor {
     footer: bool,
     footer_selected: usize,
     choice: Option<ChoicePopup>,
+    routing: Option<RoutingPopup>,
     scroll: u16,
 }
 
@@ -310,6 +489,7 @@ impl ConnectionEditor {
                 .unwrap_or_default(),
             ipv4_dns: String::new(),
             ipv4_search: String::new(),
+            ipv4_routes: Vec::new(),
             ipv4_never_default: false,
             ipv4_ignore_routes: false,
             ipv4_ignore_dns: false,
@@ -330,6 +510,7 @@ impl ConnectionEditor {
                 .unwrap_or_default(),
             ipv6_dns: String::new(),
             ipv6_search: String::new(),
+            ipv6_routes: Vec::new(),
             ipv6_never_default: false,
             ipv6_ignore_routes: false,
             ipv6_ignore_dns: false,
@@ -341,6 +522,7 @@ impl ConnectionEditor {
             footer: false,
             footer_selected: 0,
             choice: None,
+            routing: None,
             scroll: 0,
         }
     }
@@ -385,6 +567,7 @@ impl ConnectionEditor {
             ipv4_gateway: String::new(),
             ipv4_dns: String::new(),
             ipv4_search: String::new(),
+            ipv4_routes: Vec::new(),
             ipv4_never_default: false,
             ipv4_ignore_routes: false,
             ipv4_ignore_dns: false,
@@ -395,6 +578,7 @@ impl ConnectionEditor {
             ipv6_gateway: String::new(),
             ipv6_dns: String::new(),
             ipv6_search: String::new(),
+            ipv6_routes: Vec::new(),
             ipv6_never_default: false,
             ipv6_ignore_routes: false,
             ipv6_ignore_dns: false,
@@ -407,6 +591,7 @@ impl ConnectionEditor {
             footer: false,
             footer_selected: 0,
             choice: None,
+            routing: None,
             scroll: 0,
         }
     }
@@ -433,6 +618,7 @@ impl ConnectionEditor {
             EditorField::Ipv4Gateway,
             EditorField::Ipv4Dns,
             EditorField::Ipv4Search,
+            EditorField::Ipv4Routing,
             EditorField::Ipv4NeverDefault,
             EditorField::Ipv4IgnoreRoutes,
             EditorField::Ipv4IgnoreDns,
@@ -443,6 +629,7 @@ impl ConnectionEditor {
             EditorField::Ipv6Gateway,
             EditorField::Ipv6Dns,
             EditorField::Ipv6Search,
+            EditorField::Ipv6Routing,
             EditorField::Ipv6NeverDefault,
             EditorField::Ipv6IgnoreRoutes,
             EditorField::Ipv6IgnoreDns,
@@ -472,6 +659,7 @@ impl ConnectionEditor {
             EditorField::Ipv4Gateway => "Gateway",
             EditorField::Ipv4Dns => "DNS servers",
             EditorField::Ipv4Search => "Search domains",
+            EditorField::Ipv4Routing => "Routing",
             EditorField::Ipv4NeverDefault => {
                 "Never use this network for default route"
             }
@@ -490,6 +678,7 @@ impl ConnectionEditor {
             EditorField::Ipv6Gateway => "Gateway",
             EditorField::Ipv6Dns => "DNS servers",
             EditorField::Ipv6Search => "Search domains",
+            EditorField::Ipv6Routing => "Routing",
             EditorField::Ipv6NeverDefault => {
                 "Never use this network for default route"
             }
@@ -697,7 +886,46 @@ impl ConnectionEditor {
         self.focus = (self.focus as isize + delta).clamp(0, length as isize - 1)
             as usize;
         self.choice = None;
-        self.scroll = self.scroll.max(self.focus.saturating_sub(8) as u16);
+        self.routing = None;
+        self.scroll = self.focus.saturating_sub(8) as u16;
+    }
+
+    fn tab_focus(&mut self, backwards: bool) {
+        let length = self.fields().len();
+        if length == 0 {
+            return;
+        }
+        if self.footer {
+            if backwards {
+                if self.footer_selected == 0 {
+                    self.footer = false;
+                    self.focus = length - 1;
+                    self.scroll = self.focus.saturating_sub(8) as u16;
+                } else {
+                    self.footer_selected = 0;
+                }
+            } else if self.footer_selected == 1 {
+                self.footer = false;
+                self.focus = 0;
+                self.scroll = 0;
+            } else {
+                self.footer_selected = 1;
+            }
+            return;
+        }
+        if backwards {
+            if self.focus == 0 {
+                self.footer = true;
+                self.footer_selected = 1;
+            } else {
+                self.move_focus(-1);
+            }
+        } else if self.focus + 1 >= length {
+            self.footer = true;
+            self.footer_selected = 0;
+        } else {
+            self.move_focus(1);
+        }
     }
 
     fn open_choice(&mut self) {
@@ -713,6 +941,27 @@ impl ConnectionEditor {
             options,
             selected,
         });
+    }
+
+    fn open_routing(&mut self, field: EditorField) {
+        let (family, routes) = match field {
+            EditorField::Ipv4Routing => {
+                (RoutingFamily::Ipv4, self.ipv4_routes.clone())
+            }
+            EditorField::Ipv6Routing => {
+                (RoutingFamily::Ipv6, self.ipv6_routes.clone())
+            }
+            _ => return,
+        };
+        self.routing = Some(RoutingPopup::new(family, routes));
+    }
+
+    fn apply_routing(&mut self, popup: RoutingPopup) {
+        match popup.family {
+            RoutingFamily::Ipv4 => self.ipv4_routes = popup.routes,
+            RoutingFamily::Ipv6 => self.ipv6_routes = popup.routes,
+        }
+        self.routing = None;
     }
 
     fn field_line(&self, field: EditorField) -> Line<'static> {
@@ -782,6 +1031,30 @@ impl ConnectionEditor {
         ))
     }
 
+    fn routing_line(
+        &self,
+        field: EditorField,
+        routes: &[String],
+    ) -> Line<'static> {
+        let summary = if routes.is_empty() {
+            "No custom routes".to_string()
+        } else if routes.len() == 1 {
+            "1 custom route".to_string()
+        } else {
+            format!("{} custom routes", routes.len())
+        };
+        let action_style = if self.focused(field) {
+            selected_style()
+        } else {
+            panel_style().add_modifier(Modifier::BOLD)
+        };
+        Line::from(vec![
+            Span::styled(format!("{:<25}", "Routing"), label_style()),
+            Span::styled(format!("({summary}) "), panel_style()),
+            Span::styled("<Edit...>", action_style),
+        ])
+    }
+
     fn form_lines(&self) -> Vec<Line<'static>> {
         let mut lines = vec![Line::from("")];
         lines.push(self.field_line(EditorField::ProfileName));
@@ -819,9 +1092,9 @@ impl ConnectionEditor {
         lines.push(self.field_line(EditorField::Ipv4Gateway));
         lines.push(self.field_line(EditorField::Ipv4Dns));
         lines.push(self.field_line(EditorField::Ipv4Search));
-        lines.push(Line::from(
-            "                         Routing (No custom routes) <Edit...>",
-        ));
+        lines.push(
+            self.routing_line(EditorField::Ipv4Routing, &self.ipv4_routes),
+        );
         lines.push(self.checkbox_line(EditorField::Ipv4NeverDefault));
         lines.push(self.checkbox_line(EditorField::Ipv4IgnoreRoutes));
         lines.push(self.checkbox_line(EditorField::Ipv4IgnoreDns));
@@ -836,9 +1109,9 @@ impl ConnectionEditor {
         lines.push(self.field_line(EditorField::Ipv6Gateway));
         lines.push(self.field_line(EditorField::Ipv6Dns));
         lines.push(self.field_line(EditorField::Ipv6Search));
-        lines.push(Line::from(
-            "                         Routing (No custom routes) <Edit...>",
-        ));
+        lines.push(
+            self.routing_line(EditorField::Ipv6Routing, &self.ipv6_routes),
+        );
         lines.push(self.checkbox_line(EditorField::Ipv6NeverDefault));
         lines.push(self.checkbox_line(EditorField::Ipv6IgnoreRoutes));
         lines.push(self.checkbox_line(EditorField::Ipv6IgnoreDns));
@@ -955,6 +1228,7 @@ pub struct App {
     pub known_networks: Vec<KnownNetwork>,
     pub wifi_status: Option<SupplicantStatus>,
     pub main_selected: usize,
+    pub main_focus: usize,
     pub edit_selected: usize,
     pub edit_focus: usize,
     pub activation_selected: usize,
@@ -974,6 +1248,7 @@ impl Default for App {
             known_networks: Vec::new(),
             wifi_status: None,
             main_selected: 0,
+            main_focus: 0,
             edit_selected: 0,
             edit_focus: 0,
             activation_selected: 0,
@@ -1549,6 +1824,17 @@ impl App {
             .get(self.activation_selected)
             .and_then(|row| row.target.as_ref())
         {
+            Some(ActivationTarget::Interface(name))
+                if self.interfaces.iter().any(|interface| {
+                    interface.name == *name
+                        && matches!(
+                            interface.state,
+                            ConnectionState::Connected | ConnectionState::Up
+                        )
+                }) =>
+            {
+                "Deactivate"
+            }
             Some(ActivationTarget::Wifi(target))
                 if self.is_current_wifi_target(target) =>
             {
@@ -1741,12 +2027,22 @@ impl App {
         client: &mut DaemonClient,
     ) -> bool {
         use crossterm::event::KeyCode;
-        match key {
-            KeyCode::Up => self.move_main(-1),
-            KeyCode::Down => self.move_main(1),
-            KeyCode::Enter => return self.open_main_choice(client),
-            KeyCode::Esc | KeyCode::Char('q') => return true,
-            _ => {}
+        if self.main_focus == 0 {
+            match key {
+                KeyCode::Up => self.move_main(-1),
+                KeyCode::Down => self.move_main(1),
+                KeyCode::Tab | KeyCode::BackTab => self.main_focus = 1,
+                KeyCode::Enter => return self.open_main_choice(client),
+                KeyCode::Esc | KeyCode::Char('q') => return true,
+                _ => {}
+            }
+        } else {
+            match key {
+                KeyCode::Tab | KeyCode::BackTab => self.main_focus = 0,
+                KeyCode::Enter => return self.open_main_choice(client),
+                KeyCode::Esc | KeyCode::Char('q') => return true,
+                _ => {}
+            }
         }
         false
     }
@@ -1767,26 +2063,40 @@ impl App {
                 }
                 KeyCode::Char('d') => self.delete_edit(client),
                 KeyCode::Tab => self.edit_focus = 1,
+                KeyCode::BackTab => self.edit_focus = 4,
                 KeyCode::Esc => self.screen = Screen::MainMenu,
                 _ => {}
             }
         } else {
             match key {
-                KeyCode::Left => {
+                KeyCode::Up => {
                     self.edit_focus = if self.edit_focus == 1 {
                         4
                     } else {
                         self.edit_focus - 1
                     }
                 }
-                KeyCode::Right | KeyCode::Tab => {
+                KeyCode::Down => {
                     self.edit_focus = if self.edit_focus == 4 {
                         1
                     } else {
                         self.edit_focus + 1
                     }
                 }
-                KeyCode::Up if self.edit_focus == 1 => self.edit_focus = 0,
+                KeyCode::Tab => {
+                    self.edit_focus = if self.edit_focus == 4 {
+                        0
+                    } else {
+                        self.edit_focus + 1
+                    }
+                }
+                KeyCode::BackTab => {
+                    self.edit_focus = if self.edit_focus == 1 {
+                        0
+                    } else {
+                        self.edit_focus - 1
+                    }
+                }
                 KeyCode::Enter => match self.edit_focus {
                     1 => self.open_new_connection(),
                     2 => self.open_edit(),
@@ -1814,20 +2124,34 @@ impl App {
                 KeyCode::Enter => self.activate_selected(client),
                 KeyCode::Char('r') => self.refresh_wifi(client, true),
                 KeyCode::Tab => self.activation_focus = 1,
+                KeyCode::BackTab => self.activation_focus = 2,
                 KeyCode::Esc => self.screen = Screen::MainMenu,
                 _ => {}
             }
         } else {
             match key {
-                KeyCode::Left => {
+                KeyCode::Up => {
                     self.activation_focus =
                         if self.activation_focus == 1 { 2 } else { 1 }
                 }
-                KeyCode::Right | KeyCode::Tab => {
+                KeyCode::Down => {
                     self.activation_focus =
                         if self.activation_focus == 2 { 1 } else { 2 }
                 }
-                KeyCode::Up => self.activation_focus = 0,
+                KeyCode::Tab => {
+                    self.activation_focus = if self.activation_focus == 2 {
+                        0
+                    } else {
+                        self.activation_focus + 1
+                    }
+                }
+                KeyCode::BackTab => {
+                    self.activation_focus = if self.activation_focus == 1 {
+                        0
+                    } else {
+                        self.activation_focus - 1
+                    }
+                }
                 KeyCode::Enter => match self.activation_focus {
                     1 => self.activate_selected(client),
                     2 => self.screen = Screen::MainMenu,
@@ -1903,18 +2227,30 @@ impl App {
                         popup.selected = (popup.selected + 1)
                             .min(NEW_CONNECTION_TYPES.len() - 1);
                     }
-                    KeyCode::Tab | KeyCode::Right => {
+                    KeyCode::Tab => {
                         popup.focus = match popup.focus {
                             NewFocus::List => NewFocus::Cancel,
                             NewFocus::Cancel => NewFocus::Create,
                             NewFocus::Create => NewFocus::List,
                         };
                     }
-                    KeyCode::Left | KeyCode::BackTab => {
+                    KeyCode::BackTab => {
                         popup.focus = match popup.focus {
                             NewFocus::List => NewFocus::Create,
                             NewFocus::Cancel => NewFocus::List,
                             NewFocus::Create => NewFocus::Cancel,
+                        };
+                    }
+                    KeyCode::Left | KeyCode::Right
+                        if matches!(
+                            popup.focus,
+                            NewFocus::Cancel | NewFocus::Create
+                        ) =>
+                    {
+                        popup.focus = match popup.focus {
+                            NewFocus::Cancel => NewFocus::Create,
+                            NewFocus::Create => NewFocus::Cancel,
+                            NewFocus::List => NewFocus::List,
                         };
                     }
                     KeyCode::Enter => match popup.focus {
@@ -1936,7 +2272,7 @@ impl App {
                 let mut submit = None;
                 let mut cancel = false;
                 match key {
-                    KeyCode::Tab | KeyCode::Right => {
+                    KeyCode::Tab => {
                         popup.focus = match popup.focus {
                             PasswordFocus::Input => PasswordFocus::Show,
                             PasswordFocus::Show => PasswordFocus::Cancel,
@@ -1944,12 +2280,26 @@ impl App {
                             PasswordFocus::Connect => PasswordFocus::Input,
                         };
                     }
-                    KeyCode::Left | KeyCode::BackTab => {
+                    KeyCode::BackTab => {
                         popup.focus = match popup.focus {
                             PasswordFocus::Input => PasswordFocus::Connect,
                             PasswordFocus::Show => PasswordFocus::Input,
                             PasswordFocus::Cancel => PasswordFocus::Show,
                             PasswordFocus::Connect => PasswordFocus::Cancel,
+                        };
+                    }
+                    KeyCode::Left | KeyCode::Right
+                        if matches!(
+                            popup.focus,
+                            PasswordFocus::Cancel | PasswordFocus::Connect
+                        ) =>
+                    {
+                        popup.focus = match popup.focus {
+                            PasswordFocus::Cancel => PasswordFocus::Connect,
+                            PasswordFocus::Connect => PasswordFocus::Cancel,
+                            PasswordFocus::Input | PasswordFocus::Show => {
+                                popup.focus
+                            }
                         };
                     }
                     KeyCode::Char(character)
@@ -1993,6 +2343,8 @@ impl App {
             Popup::Editor(editor) => {
                 let mut save = false;
                 let mut cancel = false;
+                let mut close_routing = false;
+                let mut apply_routing = false;
                 if let Some(choice) = &mut editor.choice {
                     match key {
                         KeyCode::Up => {
@@ -2006,9 +2358,84 @@ impl App {
                         KeyCode::Esc => editor.choice = None,
                         _ => {}
                     }
+                } else if editor.routing.is_some() {
+                    {
+                        let routing = editor
+                            .routing
+                            .as_mut()
+                            .expect("routing popup exists");
+                        if routing.editing {
+                            match key {
+                                KeyCode::Char(character) => {
+                                    routing.input.push(character)
+                                }
+                                KeyCode::Backspace => {
+                                    routing.input.pop();
+                                }
+                                KeyCode::Enter => {
+                                    if let Err(error) = routing.add_route() {
+                                        routing.error = Some(error);
+                                    }
+                                }
+                                KeyCode::Esc => {
+                                    routing.editing = false;
+                                    routing.input.clear();
+                                    routing.error = None;
+                                }
+                                _ => {}
+                            }
+                        } else {
+                            match key {
+                                KeyCode::Up => routing.move_cursor(-1),
+                                KeyCode::Down => routing.move_cursor(1),
+                                KeyCode::Tab => routing.tab(false),
+                                KeyCode::BackTab => routing.tab(true),
+                                KeyCode::Left | KeyCode::Right
+                                    if matches!(
+                                        routing.focus,
+                                        RoutingFocus::Cancel | RoutingFocus::Ok
+                                    ) =>
+                                {
+                                    routing.focus = match routing.focus {
+                                        RoutingFocus::Cancel => {
+                                            RoutingFocus::Ok
+                                        }
+                                        RoutingFocus::Ok => {
+                                            RoutingFocus::Cancel
+                                        }
+                                        _ => routing.focus,
+                                    };
+                                }
+                                KeyCode::Enter => match routing.focus {
+                                    RoutingFocus::Add => routing.begin_add(),
+                                    RoutingFocus::Delete => {
+                                        routing.delete_selected()
+                                    }
+                                    RoutingFocus::Cancel => {
+                                        close_routing = true
+                                    }
+                                    RoutingFocus::Ok => apply_routing = true,
+                                    RoutingFocus::List => {}
+                                },
+                                KeyCode::Esc => close_routing = true,
+                                _ => {}
+                            }
+                        }
+                    }
+                    if close_routing {
+                        editor.routing = None;
+                    } else if apply_routing {
+                        let routing = editor
+                            .routing
+                            .take()
+                            .expect("routing popup exists");
+                        editor.apply_routing(routing);
+                    }
                 } else if editor.footer {
                     match key {
-                        KeyCode::Tab | KeyCode::Left | KeyCode::Right => {
+                        KeyCode::Tab => editor.tab_focus(false),
+                        KeyCode::BackTab => editor.tab_focus(true),
+                        KeyCode::Left | KeyCode::Right => {
                             editor.footer_selected = 1 - editor.footer_selected
                         }
                         KeyCode::Up => editor.footer = false,
@@ -2023,20 +2450,18 @@ impl App {
                     match key {
                         KeyCode::Up => editor.move_focus(-1),
                         KeyCode::Down => editor.move_focus(1),
-                        KeyCode::Tab => {
-                            if editor.focus + 1 >= editor.fields().len() {
-                                editor.footer = true;
-                            } else {
-                                editor.move_focus(1);
-                            }
-                        }
-                        KeyCode::BackTab => editor.move_focus(-1),
+                        KeyCode::Tab => editor.tab_focus(false),
+                        KeyCode::BackTab => editor.tab_focus(true),
                         KeyCode::Enter => {
                             if let Some(field) =
                                 editor.fields().get(editor.focus).copied()
                             {
-                                if ConnectionEditor::choice_options(field)
-                                    .is_some()
+                                if field.is_routing() {
+                                    editor.open_routing(field);
+                                } else if ConnectionEditor::choice_options(
+                                    field,
+                                )
+                                .is_some()
                                 {
                                     editor.open_choice();
                                 } else if field.is_bool() {
@@ -2194,7 +2619,7 @@ impl App {
             height: 1,
         };
         frame.render_widget(
-            Paragraph::new(Line::from(button_span("OK", true)))
+            Paragraph::new(Line::from(button_span("OK", self.main_focus == 1)))
                 .alignment(Alignment::Right),
             footer,
         );
@@ -2600,10 +3025,13 @@ impl App {
             width: body.width.saturating_sub(2),
             height: body.height.saturating_sub(footer_height),
         };
+        let form_lines = editor.form_lines();
+        let max_scroll =
+            form_lines.len().saturating_sub(content.height as usize) as u16;
         frame.render_widget(
-            Paragraph::new(editor.form_lines())
+            Paragraph::new(form_lines)
                 .style(panel_style())
-                .scroll((editor.scroll, 0)),
+                .scroll((editor.scroll.min(max_scroll), 0)),
             content,
         );
         let footer = Rect {
@@ -2625,6 +3053,8 @@ impl App {
         }
         if let Some(choice) = &editor.choice {
             self.draw_choice(frame, area, choice);
+        } else if let Some(routing) = &editor.routing {
+            self.draw_routing(frame, area, routing);
         }
     }
 
@@ -2649,6 +3079,94 @@ impl App {
             body,
             &mut state,
         );
+    }
+
+    fn draw_routing(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        popup: &RoutingPopup,
+    ) {
+        let rect = centered(area, 72, 18);
+        draw_frame(frame, rect, popup.title());
+        let body = inner(rect);
+        let vertical = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Min(5),
+                Constraint::Length(if popup.editing { 3 } else { 0 }),
+            ])
+            .split(body);
+        frame.render_widget(
+            Paragraph::new(format!("Enter routes as {}.", popup.placeholder()))
+                .style(panel_style()),
+            vertical[0],
+        );
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(72),
+                Constraint::Percentage(28),
+            ])
+            .split(vertical[1]);
+        let items = if popup.routes.is_empty() {
+            vec![ListItem::new(Span::styled(
+                "  (no custom routes)",
+                disabled_style(),
+            ))]
+        } else {
+            popup
+                .routes
+                .iter()
+                .map(|route| ListItem::new(format!("  {route}")))
+                .collect()
+        };
+        let mut state = ListState::default();
+        if popup.focus == RoutingFocus::List && !popup.routes.is_empty() {
+            state.select(Some(popup.selected));
+        }
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(
+                    Block::default().borders(Borders::ALL).style(panel_style()),
+                )
+                .highlight_style(selected_style())
+                .highlight_symbol(""),
+            columns[0],
+            &mut state,
+        );
+        self.draw_buttons(
+            frame,
+            columns[1],
+            &["Add", "Delete", "Cancel", "OK"],
+            popup.focus.index(),
+        );
+        if popup.editing {
+            let input = Line::from(vec![
+                Span::styled("Route ", label_style()),
+                Span::styled(format!(" {:<52}", popup.input), selected_style()),
+            ]);
+            let hint = popup.error.as_deref().map_or_else(
+                || "Enter to add, Esc to cancel".to_string(),
+                str::to_string,
+            );
+            frame.render_widget(
+                Paragraph::new(vec![
+                    input,
+                    Line::from(Span::styled(
+                        hint,
+                        if popup.error.is_some() {
+                            panel_style().fg(Color::Red)
+                        } else {
+                            disabled_style()
+                        },
+                    )),
+                ])
+                .style(panel_style()),
+                vertical[2],
+            );
+        }
     }
 }
 
@@ -2784,6 +3302,13 @@ fn signal_bars(signal: i32) -> &'static str {
 mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend, style::Modifier};
+    use std::{
+        io::Write,
+        os::unix::net::UnixListener,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    static NEXT_SOCKET: AtomicUsize = AtomicUsize::new(0);
 
     fn ethernet(name: &str, state: ConnectionState) -> InterfaceInfo {
         let mut info = InterfaceInfo::new(1, name);
@@ -2808,6 +3333,27 @@ mod tests {
             })
             .collect::<String>();
         (text, highlighted)
+    }
+
+    fn test_client() -> DaemonClient {
+        let socket = std::env::temp_dir().join(format!(
+            "network-daemon-tui-app-{}-{}.sock",
+            std::process::id(),
+            NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&socket);
+        let listener = UnixListener::bind(&socket).unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .write_all(
+                    b"{\"subsystem\":\"Global\",\"response\":\"Established\"}\n",
+                )
+                .unwrap();
+        });
+        let client = DaemonClient::connect(&socket).unwrap();
+        let _ = std::fs::remove_file(socket);
+        client
     }
 
     #[test]
@@ -2897,6 +3443,90 @@ mod tests {
     }
 
     #[test]
+    fn activation_screen_uses_deactivate_for_active_ethernet() {
+        let app = App {
+            screen: Screen::ActivateConnections,
+            interfaces: vec![ethernet("eth0", ConnectionState::Connected)],
+            activation_selected: 1,
+            ..App::default()
+        };
+        let (text, _) = render(&app);
+        assert!(text.contains("* Wired connection 1 (eth0)"));
+        assert!(text.contains("<Deactivate>"));
+        assert!(!text.contains("<Activate>"));
+    }
+
+    #[test]
+    fn tab_cycles_list_and_button_regions_without_arrow_aliases() {
+        let mut main = App::default();
+        let mut edit = App {
+            screen: Screen::EditConnections,
+            interfaces: vec![ethernet("eth0", ConnectionState::Disconnected)],
+            ..App::default()
+        };
+        let mut client = test_client();
+        main.handle_key(crossterm::event::KeyCode::Tab, &mut client);
+        assert_eq!(main.main_focus, 1);
+        main.handle_key(crossterm::event::KeyCode::Tab, &mut client);
+        assert_eq!(main.main_focus, 0);
+
+        for expected in [1, 2, 3, 4, 0] {
+            edit.handle_key(crossterm::event::KeyCode::Tab, &mut client);
+            assert_eq!(edit.edit_focus, expected);
+        }
+        edit.handle_key(crossterm::event::KeyCode::Right, &mut client);
+        assert_eq!(edit.edit_focus, 0);
+        edit.handle_key(crossterm::event::KeyCode::Tab, &mut client);
+        edit.handle_key(crossterm::event::KeyCode::Up, &mut client);
+        assert_eq!(edit.edit_focus, 4);
+
+        let mut activate = App {
+            screen: Screen::ActivateConnections,
+            interfaces: vec![ethernet("eth0", ConnectionState::Disconnected)],
+            activation_selected: 1,
+            ..App::default()
+        };
+        for expected in [1, 2, 0] {
+            activate.handle_key(crossterm::event::KeyCode::Tab, &mut client);
+            assert_eq!(activate.activation_focus, expected);
+        }
+        activate.handle_key(crossterm::event::KeyCode::Left, &mut client);
+        assert_eq!(activate.activation_focus, 0);
+
+        let editor = ConnectionEditor::from_interface(&ethernet(
+            "eth0",
+            ConnectionState::Disconnected,
+        ));
+        let last_field = editor.fields().len() - 1;
+        let mut editor_app = App {
+            screen: Screen::EditConnections,
+            popup: Popup::Editor(Box::new(editor.clone())),
+            ..App::default()
+        };
+        for _ in 0..last_field {
+            editor_app.handle_key(crossterm::event::KeyCode::Tab, &mut client);
+        }
+        let Popup::Editor(editor) = &editor_app.popup else {
+            panic!("expected editor popup");
+        };
+        assert_eq!(editor.focus, last_field);
+        assert!(!editor.footer);
+        editor_app.handle_key(crossterm::event::KeyCode::Tab, &mut client);
+        let Popup::Editor(editor) = &editor_app.popup else {
+            panic!("expected editor popup");
+        };
+        assert!(editor.footer);
+        assert_eq!(editor.footer_selected, 0);
+        editor_app.handle_key(crossterm::event::KeyCode::Tab, &mut client);
+        editor_app.handle_key(crossterm::event::KeyCode::Tab, &mut client);
+        let Popup::Editor(editor) = &editor_app.popup else {
+            panic!("expected editor popup");
+        };
+        assert!(!editor.footer);
+        assert_eq!(editor.focus, 0);
+    }
+
+    #[test]
     fn new_connection_popup_matches_reference_picker() {
         let app = App {
             screen: Screen::EditConnections,
@@ -2935,6 +3565,88 @@ mod tests {
         assert!(text.contains("Automatically connect"));
         assert!(text.contains("<Cancel>"));
         assert!(text.contains("<OK>"));
+    }
+
+    #[test]
+    fn editor_scroll_follows_focus_in_both_directions() {
+        let mut editor = ConnectionEditor::from_interface(&ethernet(
+            "eth0",
+            ConnectionState::Disconnected,
+        ));
+        for _ in 0..16 {
+            editor.move_focus(1);
+        }
+        let down_scroll = editor.scroll;
+        assert!(down_scroll > 0);
+
+        editor.move_focus(-1);
+        assert!(editor.scroll < down_scroll);
+
+        editor.move_focus(-100);
+        assert_eq!(editor.focus, 0);
+        assert_eq!(editor.scroll, 0);
+    }
+
+    #[test]
+    fn routing_is_a_focusable_editor_field_with_an_edit_popup() {
+        let mut editor = ConnectionEditor::from_interface(&ethernet(
+            "eth0",
+            ConnectionState::Disconnected,
+        ));
+        let fields = editor.fields();
+        let routing_index = fields
+            .iter()
+            .position(|field| *field == EditorField::Ipv4Routing)
+            .unwrap();
+        editor.focus = routing_index;
+
+        let app = App {
+            screen: Screen::EditConnections,
+            popup: Popup::Editor(Box::new(editor.clone())),
+            ..App::default()
+        };
+        let (text, _) = render(&app);
+        assert!(text.contains("Routing"));
+        assert!(text.contains("<Edit...>"));
+
+        let mut app = App {
+            screen: Screen::EditConnections,
+            popup: Popup::Editor(Box::new(editor)),
+            ..App::default()
+        };
+        let mut client = test_client();
+        app.handle_key(crossterm::event::KeyCode::Enter, &mut client);
+        let Popup::Editor(editor) = &app.popup else {
+            panic!("expected editor popup");
+        };
+        assert!(matches!(
+            editor.routing.as_ref().map(|popup| popup.family),
+            Some(RoutingFamily::Ipv4)
+        ));
+        let (text, _) = render(&app);
+        assert!(text.contains("Edit IPv4 Routes"));
+        assert!(text.contains("<Add>"));
+        assert!(text.contains("<OK>"));
+    }
+
+    #[test]
+    fn routing_popup_validates_and_applies_routes() {
+        let mut editor = ConnectionEditor::from_interface(&ethernet(
+            "eth0",
+            ConnectionState::Disconnected,
+        ));
+        editor.open_routing(EditorField::Ipv4Routing);
+        let popup = editor.routing.as_mut().unwrap();
+        popup.begin_add();
+        popup.input = "10.0.0.0/24 192.168.1.1".to_string();
+        popup.add_route().unwrap();
+        assert_eq!(popup.routes, ["10.0.0.0/24 192.168.1.1"]);
+        assert_eq!(popup.selected, 0);
+
+        let popup = editor.routing.take().unwrap();
+        editor.apply_routing(popup);
+        assert_eq!(editor.ipv4_routes, ["10.0.0.0/24 192.168.1.1"]);
+        assert!(editor.routing.is_none());
     }
 
     #[test]
