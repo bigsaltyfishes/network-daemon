@@ -42,6 +42,17 @@ impl fmt::Display for Security {
 }
 
 impl Security {
+    /// Parse the stable security name used by the daemon configuration.
+    pub fn from_name(name: &str) -> Self {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "open" | "none" => Self::Open,
+            "psk" | "wpa-psk" | "wpa2-psk" => Self::Psk,
+            "eap" | "wpa-eap" | "ieee8021x" => Self::Eap,
+            "unknown" | "n/a" | "na" | "" => Self::Unknown,
+            _ => Self::Unknown,
+        }
+    }
+
     /// Parse from wpa_supplicant flags string (from SCAN_RESULTS)
     ///
     /// # Arguments

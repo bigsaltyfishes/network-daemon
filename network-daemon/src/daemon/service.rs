@@ -10,6 +10,7 @@ use kameo::{
 };
 use libnetwork_daemon::{
     ConnectionState, InterfaceManagerAction, InterfaceManagerEvent,
+    KnownNetwork, KnownNetworkState, MacAddr, Security, WiFiManagerAction,
     WiFiManagerEvent, WpaState, ensure, error::NetworkDaemonError, ignore,
 };
 use nix::fcntl::{Flock, FlockArg};
@@ -20,7 +21,7 @@ use crate::{
     dhcp::DhcpManager,
     interface::InterfaceManager,
     route::RouteManager,
-    storage::{StorageManager, StoragePaths},
+    storage::{Credential, StorageManager, StoragePaths, StorageResult},
     wifi::{WifiManager, WifiManagerBackend},
 };
 
@@ -350,6 +351,18 @@ where
                         self.wifi_supervisors
                             .insert(iface_name.clone(), supervisor_ref);
 
+                        let networks =
+                            self.load_persisted_networks(info.mac_addr).await;
+                        ignore!(
+                            self.wifi_supervisors
+                                .get(&iface_name)
+                                .expect("Wi-Fi supervisor was just inserted")
+                                .ask(WiFiManagerAction::LoadNetworks {
+                                    networks
+                                })
+                                .await
+                        );
+
                         info!(
                             "Started WiFi Manager for interface: {}",
                             info.name
@@ -476,4 +489,125 @@ where
             }
         }
     }
+}
+
+impl<W> NetworkDaemon<W>
+where
+    W: WifiManagerBackend,
+{
+    /// Load the saved AP profiles belonging to one WLAN MAC. Entries written
+    /// by older daemon versions have no MAC and are used only when that
+    /// interface has no newer, MAC-scoped entries in the corresponding store.
+    async fn load_persisted_networks(
+        &self,
+        interface_mac: Option<MacAddr>,
+    ) -> Vec<KnownNetwork> {
+        let credentials = match self.storage.ask(()).await {
+            Ok(StorageResult::Credentials(credentials)) => credentials,
+            Ok(StorageResult::Ok) | Err(_) => Vec::new(),
+        };
+        let config = crate::config::DaemonConfig::load(&self.config_path)
+            .unwrap_or_default();
+        persisted_networks(&config, &credentials, interface_mac)
+    }
+}
+
+fn persisted_networks(
+    config: &crate::config::DaemonConfig,
+    credentials: &[Credential],
+    interface_mac: Option<MacAddr>,
+) -> Vec<KnownNetwork> {
+    let mac = interface_mac.map(|value| value.to_string());
+    let has_scoped_config = mac.as_deref().is_some_and(|mac| {
+        config
+            .networks
+            .iter()
+            .any(|network| network.interface_mac.as_deref() == Some(mac))
+    });
+    let has_scoped_credentials = mac.as_deref().is_some_and(|mac| {
+        credentials
+            .iter()
+            .any(|credential| credential.interface_mac.as_deref() == Some(mac))
+    });
+
+    let config_in_scope = |network: &crate::config::NetworkConfig| {
+        network.interface_mac.as_deref() == mac.as_deref()
+            || (mac.is_some()
+                && !has_scoped_config
+                && network.interface_mac.is_none())
+    };
+    let credential_in_scope = |credential: &Credential| {
+        credential.interface_mac.as_deref() == mac.as_deref()
+            || (mac.is_some()
+                && !has_scoped_credentials
+                && credential.interface_mac.is_none())
+    };
+
+    let mut networks: HashMap<
+        (String, Option<MacAddr>, Security),
+        KnownNetwork,
+    > = HashMap::new();
+    for metadata in config
+        .networks
+        .iter()
+        .filter(|network| config_in_scope(network))
+    {
+        let bssid = metadata.bssid.as_deref().and_then(MacAddr::parse);
+        let security = Security::from_name(&metadata.security);
+        networks.insert(
+            (metadata.ssid.clone(), bssid, security),
+            KnownNetwork {
+                id: None,
+                priority: metadata.priority,
+                hidden: metadata.hidden,
+                security,
+                state: if metadata.enabled {
+                    KnownNetworkState::Enabled
+                } else {
+                    KnownNetworkState::Disabled
+                },
+                ssid: metadata.ssid.clone(),
+                bssid,
+                password: None,
+                identity: None,
+                autoconnect: metadata.enabled,
+            },
+        );
+    }
+
+    for credential in credentials
+        .iter()
+        .filter(|credential| credential_in_scope(credential))
+    {
+        let bssid = credential.bssid.as_deref().and_then(MacAddr::parse);
+        let security = Security::from_name(&credential.security);
+        let key = (credential.ssid.clone(), bssid, security);
+        let network = networks.entry(key).or_insert_with(|| KnownNetwork {
+            id: None,
+            priority: 0,
+            hidden: false,
+            security,
+            state: KnownNetworkState::Enabled,
+            ssid: credential.ssid.clone(),
+            bssid,
+            password: None,
+            identity: None,
+            autoconnect: true,
+        });
+        network.password = credential.psk.clone();
+        network.identity = credential.identity.clone();
+    }
+
+    let mut networks = networks.into_values().collect::<Vec<_>>();
+    networks.sort_by_key(|network| {
+        (
+            network.ssid.clone(),
+            network.security.to_string(),
+            network
+                .bssid
+                .map(|bssid| bssid.to_string())
+                .unwrap_or_default(),
+        )
+    });
+    networks
 }

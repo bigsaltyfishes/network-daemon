@@ -51,8 +51,10 @@ pub struct WpaSupplicant {
     // Cached scan results (ordered as reported by wpa_supplicant)
     scan_results: Vec<ScanResult>,
 
-    // Known networks keyed by SSID, then optional BSSID bucket
-    known_networks: HashMap<String, KnownSsidEntry>,
+    // Known networks keyed by SSID and authentication type, then optional
+    // BSSID bucket. Equal SSIDs with different authentication are distinct
+    // profiles; a no-BSSID profile remains roamable.
+    known_networks: HashMap<(String, Security), KnownSsidEntry>,
 
     // Channels for notifying subscribers
     supervisor: ActorRef<WifiManager<Self>>,
@@ -169,6 +171,20 @@ impl WpaSupplicant {
         }
 
         Ok(networks)
+    }
+
+    fn load_known_networks(&mut self, networks: Vec<KnownNetwork>) {
+        self.known_networks.clear();
+        for network in networks {
+            let key = (network.ssid.clone(), network.security);
+            let entry = self.known_networks.entry(key).or_default();
+            match network.bssid {
+                Some(bssid) => {
+                    entry.by_bssid.insert(bssid, network);
+                }
+                None => entry.no_bssid = Some(network),
+            }
+        }
     }
 
     /// Get a specific network value
@@ -457,7 +473,30 @@ impl WpaSupplicant {
         password: Option<String>,
         identity: Option<String>,
         hidden: bool,
+        autoconnect: bool,
     ) -> Result<(), WifiError> {
+        let key = (ssid.clone(), security);
+        let previous = self
+            .known_networks
+            .get(&key)
+            .and_then(|entry| match bssid {
+                Some(mac) => entry.by_bssid.get(&mac),
+                None => entry.no_bssid.as_ref(),
+            })
+            .cloned();
+        // An edit does not reveal secrets to the client. An omitted secret
+        // therefore means "keep the existing value" for this profile.
+        let password = password.or_else(|| {
+            previous
+                .as_ref()
+                .and_then(|network| network.password.clone())
+        });
+        let identity = identity.or_else(|| {
+            previous
+                .as_ref()
+                .and_then(|network| network.identity.clone())
+        });
+
         // Validate credentials early to avoid storing unusable entries.
         match security {
             Security::Psk => {
@@ -488,15 +527,20 @@ impl WpaSupplicant {
             priority: 0,
             hidden,
             security,
-            state: KnownNetworkState::Enabled,
+            state: if autoconnect {
+                KnownNetworkState::Enabled
+            } else {
+                KnownNetworkState::Disabled
+            },
             ssid: ssid.clone(),
             bssid,
             password: password.clone(),
             identity: identity.clone(),
+            autoconnect,
         };
 
         let prev = {
-            let entry = self.known_networks.entry(ssid.clone()).or_default();
+            let entry = self.known_networks.entry(key.clone()).or_default();
             match bssid {
                 Some(mac) => entry.by_bssid.remove(&mac),
                 None => entry.no_bssid.take(),
@@ -507,7 +551,7 @@ impl WpaSupplicant {
             self.unregister_wpa_network(&prev).await;
         }
 
-        let entry = self.known_networks.entry(ssid).or_default();
+        let entry = self.known_networks.entry(key).or_default();
         match bssid {
             Some(mac) => {
                 known.bssid = Some(mac);
@@ -525,9 +569,34 @@ impl WpaSupplicant {
         &mut self,
         ssid: &str,
         bssid: Option<MacAddr>,
+        security: Option<Security>,
     ) -> Result<(), WifiError> {
+        let key = security
+            .map(|security| (ssid.to_string(), security))
+            .or_else(|| {
+                self.known_networks
+                    .keys()
+                    .find(|(candidate_ssid, candidate_security)| {
+                        if candidate_ssid != ssid {
+                            return false;
+                        }
+                        self.known_networks
+                            .get(&(candidate_ssid.clone(), *candidate_security))
+                            .is_some_and(|entry| match bssid {
+                                Some(mac) => entry.by_bssid.contains_key(&mac),
+                                None => entry.no_bssid.is_some(),
+                            })
+                    })
+                    .cloned()
+            });
+        let Some(key) = key else {
+            return Err(WifiError::KnownNetworkNotFound {
+                ssid: ssid.to_string(),
+                bssid,
+            });
+        };
         let removed = {
-            let entry = self.known_networks.get_mut(ssid).ok_or_else(|| {
+            let entry = self.known_networks.get_mut(&key).ok_or_else(|| {
                 WifiError::KnownNetworkNotFound {
                     ssid: ssid.to_string(),
                     bssid,
@@ -550,12 +619,12 @@ impl WpaSupplicant {
 
         let should_prune = self
             .known_networks
-            .get(ssid)
+            .get(&key)
             .map(|entry| entry.no_bssid.is_none() && entry.by_bssid.is_empty())
             .unwrap_or(false);
 
         if should_prune {
-            self.known_networks.remove(ssid);
+            self.known_networks.remove(&key);
         }
 
         Ok(())
@@ -564,9 +633,22 @@ impl WpaSupplicant {
     fn select_known_candidate(
         &self,
         ssid: &str,
+        security: Option<Security>,
         requested_bssid: Option<MacAddr>,
-    ) -> Result<(MacAddr, KnownNetwork), WifiError> {
-        let entry = self.known_networks.get(ssid).ok_or_else(|| {
+    ) -> Result<(Option<MacAddr>, KnownNetwork), WifiError> {
+        let key = security
+            .map(|security| (ssid.to_string(), security))
+            .or_else(|| {
+                self.known_networks
+                    .keys()
+                    .find(|(candidate_ssid, _)| candidate_ssid == ssid)
+                    .cloned()
+            })
+            .ok_or_else(|| WifiError::KnownNetworkNotFound {
+                ssid: ssid.to_string(),
+                bssid: requested_bssid,
+            })?;
+        let entry = self.known_networks.get(&key).ok_or_else(|| {
             WifiError::KnownNetworkNotFound {
                 ssid: ssid.to_string(),
                 bssid: requested_bssid,
@@ -574,55 +656,33 @@ impl WpaSupplicant {
         })?;
 
         match requested_bssid {
-            Some(mac) => entry
-                .by_bssid
-                .get(&mac)
-                .cloned()
-                .map(|n| (mac, n))
-                .ok_or_else(|| WifiError::KnownNetworkNotFound {
-                    ssid: ssid.to_string(),
-                    bssid: Some(mac),
-                }),
+            Some(mac) => {
+                if let Some(known) = entry.by_bssid.get(&mac).cloned() {
+                    Ok((Some(mac), known))
+                } else if let Some(known) = entry.no_bssid.clone() {
+                    Ok((Some(mac), known))
+                } else {
+                    Err(WifiError::KnownNetworkNotFound {
+                        ssid: ssid.to_string(),
+                        bssid: Some(mac),
+                    })
+                }
+            }
             None => {
-                let scans: Vec<(usize, &ScanResult)> = self
-                    .scan_results
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, r)| r.ssid == ssid)
-                    .collect();
-
-                if scans.is_empty() {
-                    return Err(WifiError::SsidUnavailable {
-                        ssid: ssid.to_string(),
-                    });
+                if let Some(known) = entry.no_bssid.clone() {
+                    return Ok((None, known));
                 }
 
-                if entry.by_bssid.is_empty() {
-                    if scans.len() == 1 {
-                        let (_, scan) = scans[0];
-                        // Use the sole BSSID even though it was not
-                        // pre-registered.
-                        let mut known =
-                            entry.no_bssid.clone().ok_or_else(|| {
-                                WifiError::KnownNetworkNotFound {
-                                    ssid: ssid.to_string(),
-                                    bssid: None,
-                                }
-                            })?;
-                        let bssid = scan.bssid;
-                        known.bssid = Some(bssid);
-                        return Ok((bssid, known));
-                    }
-
-                    return Err(WifiError::BssidRequired {
-                        ssid: ssid.to_string(),
-                    });
-                }
-
-                // Pick strongest known BSSID; tie-break by scan order.
+                // A BSSID-scoped saved profile can still be used without a
+                // BSSID lock. Pick credentials from the strongest matching
+                // AP, but return `None` so wpa_supplicant can roam.
                 let mut best: Option<(i32, usize, MacAddr, KnownNetwork)> =
                     None;
-                for (idx, scan) in scans {
+                for (idx, scan) in
+                    self.scan_results.iter().enumerate().filter(|(_, scan)| {
+                        scan.ssid == ssid && scan.security == key.1
+                    })
+                {
                     if let Some(known) = entry.by_bssid.get(&scan.bssid) {
                         match &best {
                             Some((best_signal, best_idx, _, _))
@@ -642,7 +702,12 @@ impl WpaSupplicant {
                 }
 
                 if let Some((_, _, bssid, known)) = best {
-                    Ok((bssid, known))
+                    let _ = bssid;
+                    Ok((None, known))
+                } else if let Some(known) =
+                    entry.by_bssid.values().next().cloned()
+                {
+                    Ok((None, known))
                 } else {
                     Err(WifiError::SsidUnavailable {
                         ssid: ssid.to_string(),
@@ -681,10 +746,11 @@ impl WpaSupplicant {
     async fn connect_known(
         &mut self,
         ssid: String,
+        security: Option<Security>,
         bssid: Option<MacAddr>,
     ) -> Result<(), WifiError> {
         let (target_bssid, mut known) =
-            self.select_known_candidate(&ssid, bssid)?;
+            self.select_known_candidate(&ssid, security, bssid)?;
 
         // Remove existing entry in supplicant if present before reconnecting
         self.unregister_wpa_network(&known).await;
@@ -692,7 +758,7 @@ impl WpaSupplicant {
         let nwid = self
             .add_and_configure_network(
                 &known.ssid,
-                Some(target_bssid),
+                target_bssid,
                 known.security,
                 known.password.as_deref(),
                 known.identity.as_deref(),
@@ -705,8 +771,14 @@ impl WpaSupplicant {
         known.id = Some(nwid);
         known.state = KnownNetworkState::Current;
 
-        let entry = self.known_networks.entry(ssid).or_default();
-        entry.by_bssid.insert(target_bssid, known);
+        let key = (known.ssid.clone(), known.security);
+        let entry = self.known_networks.entry(key).or_default();
+        match known.bssid {
+            Some(bssid) => {
+                entry.by_bssid.insert(bssid, known);
+            }
+            None => entry.no_bssid = Some(known),
+        }
 
         Ok(())
     }
@@ -901,18 +973,33 @@ impl Message<WiFiManagerAction> for WpaSupplicant {
                 password,
                 identity,
                 hidden,
+                autoconnect,
             } => self
                 .register_known_network(
-                    ssid, bssid, security, password, identity, hidden,
+                    ssid,
+                    bssid,
+                    security,
+                    password,
+                    identity,
+                    hidden,
+                    autoconnect,
                 )
                 .await
                 .map(WiFiManagerResponse::Success)?,
-            WiFiManagerAction::RemoveNetwork { ssid, bssid } => self
-                .remove_known_network(&ssid, bssid)
+            WiFiManagerAction::RemoveNetwork {
+                ssid,
+                bssid,
+                security,
+            } => self
+                .remove_known_network(&ssid, bssid, security)
                 .await
                 .map(WiFiManagerResponse::Success)?,
-            WiFiManagerAction::Connect { ssid, bssid } => self
-                .connect_known(ssid, bssid)
+            WiFiManagerAction::Connect {
+                ssid,
+                bssid,
+                security,
+            } => self
+                .connect_known(ssid, security, bssid)
                 .await
                 .map(WiFiManagerResponse::Success)?,
             WiFiManagerAction::Disconnect => {
@@ -973,6 +1060,10 @@ impl Message<WiFiManagerAction> for WpaSupplicant {
                         )));
                     }
                 }
+            }
+            WiFiManagerAction::LoadNetworks { networks } => {
+                self.load_known_networks(networks);
+                WiFiManagerResponse::Success(())
             }
         })
     }

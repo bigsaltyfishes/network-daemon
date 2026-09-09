@@ -74,6 +74,13 @@ pub struct KnownNetwork {
     /// Identity for EAP networks
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identity: Option<String>,
+    /// Whether the network is eligible for automatic connection.
+    #[serde(default = "default_true")]
+    pub autoconnect: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl KnownNetwork {
@@ -120,6 +127,7 @@ impl KnownNetwork {
             bssid,
             password: None,
             identity: None,
+            autoconnect: !matches!(state, KnownNetworkState::Disabled),
         })
     }
 

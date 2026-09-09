@@ -55,6 +55,10 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NetworkConfig {
     pub ssid: String,
+    /// MAC address of the WLAN interface that owns this saved AP.
+    /// `None` keeps compatibility with pre-MAC configuration entries.
+    #[serde(default)]
+    pub interface_mac: Option<String>,
     /// Optional BSSID lock (MAC string). Credentials are keyed by this too.
     #[serde(default)]
     pub bssid: Option<String>,
@@ -126,13 +130,14 @@ impl DaemonConfig {
         std::fs::rename(&tmp, path).map_err(ConfigError::Read)
     }
 
-    /// Insert or update the metadata for a known network (by ssid/bssid).
+    /// Insert or update metadata for one interface-owned AP profile.
     pub fn upsert_network(&mut self, net: NetworkConfig) {
-        if let Some(existing) = self
-            .networks
-            .iter_mut()
-            .find(|n| n.ssid == net.ssid && n.bssid == net.bssid)
-        {
+        if let Some(existing) = self.networks.iter_mut().find(|n| {
+            n.interface_mac == net.interface_mac
+                && n.ssid == net.ssid
+                && n.bssid == net.bssid
+                && n.security == net.security
+        }) {
             *existing = net;
         } else {
             self.networks.push(net);
@@ -140,10 +145,21 @@ impl DaemonConfig {
     }
 
     /// Remove the metadata for a known network. Returns whether it existed.
-    pub fn remove_network(&mut self, ssid: &str, bssid: Option<&str>) -> bool {
+    pub fn remove_network(
+        &mut self,
+        interface_mac: Option<&str>,
+        ssid: &str,
+        bssid: Option<&str>,
+        security: Option<&str>,
+    ) -> bool {
         let before = self.networks.len();
-        self.networks
-            .retain(|n| !(n.ssid == ssid && n.bssid.as_deref() == bssid));
+        self.networks.retain(|n| {
+            let same = n.interface_mac.as_deref() == interface_mac
+                && n.ssid == ssid
+                && n.bssid.as_deref() == bssid
+                && security.is_none_or(|value| n.security == value);
+            !same
+        });
         self.networks.len() != before
     }
 }
@@ -178,6 +194,7 @@ priority = 5
         assert_eq!(n.priority, 5);
         assert!(n.enabled); // default true
         assert!(n.bssid.is_none());
+        assert!(n.interface_mac.is_none());
     }
 
     #[test]

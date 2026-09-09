@@ -14,8 +14,9 @@ use kameo::{
 };
 use libnetwork_daemon::{
     DaemonCommand, DaemonResponse, GlobalDaemonAction, GlobalDaemonResponse,
-    InterfaceManagerAction, InterfaceResponse, Security, WiFiManagerAction,
-    WiFiManagerResponse, ensure, error::NetworkDaemonError, ignore,
+    InterfaceManagerAction, InterfaceResponse, MacAddr, Security,
+    WiFiManagerAction, WiFiManagerResponse, ensure, error::NetworkDaemonError,
+    ignore,
 };
 use tracing::error;
 
@@ -298,19 +299,36 @@ where
                                         password,
                                         identity,
                                         hidden,
+                                        autoconnect,
                                     } => {
+                                        let interface_mac =
+                                            self.interface_mac(&iface).await;
                                         self.persist_network(
-                                            ssid, bssid, security, password,
-                                            identity, hidden,
+                                            interface_mac,
+                                            ssid,
+                                            bssid,
+                                            security,
+                                            password,
+                                            identity,
+                                            hidden,
+                                            autoconnect,
                                         )
                                         .await;
                                     }
                                     WiFiManagerAction::RemoveNetwork {
                                         ssid,
                                         bssid,
+                                        security,
                                     } => {
-                                        self.remove_persisted(ssid, bssid)
-                                            .await;
+                                        let interface_mac =
+                                            self.interface_mac(&iface).await;
+                                        self.remove_persisted(
+                                            interface_mac,
+                                            ssid,
+                                            bssid,
+                                            security.as_ref(),
+                                        )
+                                        .await;
                                     }
                                     _ => {}
                                 }
@@ -514,6 +532,20 @@ where
         None
     }
 
+    /// Resolve the current WLAN MAC used as the stable persistence key.
+    async fn interface_mac(&self, iface: &str) -> Option<MacAddr> {
+        match self
+            .ifmgr
+            .ask(InterfaceManagerAction::GetInterfaceInfo {
+                name: iface.to_string(),
+            })
+            .await
+        {
+            Ok(InterfaceResponse::Info(info)) => info.mac_addr,
+            Ok(_) | Err(_) => None,
+        }
+    }
+
     /// Read the live kernel hostname for the hostname activity.
     fn read_hostname() -> Result<String, std::io::Error> {
         let mut buffer = [0u8; 256];
@@ -555,15 +587,18 @@ where
     /// Persist a known network: metadata to config.toml, credential to SQLite.
     async fn persist_network(
         &self,
+        interface_mac: Option<MacAddr>,
         ssid: &str,
         bssid: &Option<libnetwork_daemon::MacAddr>,
         security: &Security,
         password: &Option<String>,
         identity: &Option<String>,
         hidden: &bool,
+        autoconnect: &bool,
     ) {
         // Sensitive credential → SQLite (encrypted at rest).
         let cred = Credential {
+            interface_mac: interface_mac.map(|m| m.to_string()),
             ssid: ssid.to_string(),
             bssid: bssid.map(|m| m.to_string()),
             security: security.to_string(),
@@ -580,11 +615,12 @@ where
         let mut cfg = DaemonConfig::load(&self.config_path).unwrap_or_default();
         cfg.upsert_network(NetworkConfig {
             ssid: ssid.to_string(),
+            interface_mac: interface_mac.map(|m| m.to_string()),
             bssid: bssid.map(|m| m.to_string()),
             security: security.to_string(),
             hidden: *hidden,
             priority: 0,
-            enabled: true,
+            enabled: *autoconnect,
         });
         if let Err(e) = cfg.save(&self.config_path) {
             error!("failed to save config: {}", e);
@@ -594,23 +630,53 @@ where
     /// Remove a persisted known network (SQLite + config.toml).
     async fn remove_persisted(
         &self,
+        interface_mac: Option<MacAddr>,
         ssid: &str,
         bssid: &Option<libnetwork_daemon::MacAddr>,
+        security: Option<&Security>,
     ) {
         let b = bssid.map(|m| m.to_string());
+        let interface_mac = interface_mac.map(|m| m.to_string());
+        let security = security.map(ToString::to_string);
         if let Err(e) = self
             .storage
             .ask(StorageCommand::RemoveCredential {
+                interface_mac: interface_mac.clone(),
                 ssid: ssid.to_string(),
                 bssid: b.clone(),
+                security: security.clone(),
             })
             .await
         {
             error!("failed to remove credential: {:?}", e);
         }
+        // Legacy unscoped profiles are accepted only as a migration fallback
+        // and must disappear when the user deletes the corresponding profile
+        // from its current interface.
+        if interface_mac.is_some()
+            && let Err(e) = self
+                .storage
+                .ask(StorageCommand::RemoveCredential {
+                    interface_mac: None,
+                    ssid: ssid.to_string(),
+                    bssid: b.clone(),
+                    security: security.clone(),
+                })
+                .await
+        {
+            error!("failed to remove legacy credential: {:?}", e);
+        }
 
         let mut cfg = DaemonConfig::load(&self.config_path).unwrap_or_default();
-        cfg.remove_network(ssid, b.as_deref());
+        cfg.remove_network(
+            interface_mac.as_deref(),
+            ssid,
+            b.as_deref(),
+            security.as_deref(),
+        );
+        if interface_mac.is_some() {
+            cfg.remove_network(None, ssid, b.as_deref(), security.as_deref());
+        }
         if let Err(e) = cfg.save(&self.config_path) {
             error!("failed to save config: {}", e);
         }

@@ -2,6 +2,7 @@
 
 use std::{
     cmp::Reverse,
+    collections::BTreeMap,
     time::{Duration, Instant},
 };
 
@@ -52,7 +53,10 @@ pub enum Popup {
     Message(MessagePopup),
     NewConnection(NewConnectionPopup),
     WirelessDevices(WirelessDevicePopup),
-    Password(PasswordPopup),
+    BindBssid(BindBssidPopup),
+    WifiCredentials(WifiCredentialsPopup),
+    SavedNetworks(SavedNetworksPopup),
+    AccessPointEditor(AccessPointEditorPopup),
     Connecting(ConnectingPopup),
     Editor(Box<ConnectionEditor>),
 }
@@ -97,22 +101,495 @@ struct WifiTarget {
     bssid: Option<MacAddr>,
     security: Security,
     hidden: bool,
+    candidates: Vec<ScanResult>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct WifiInterfaceState {
+    mac: Option<MacAddr>,
+    scan_results: Vec<ScanResult>,
+    known_networks: Vec<KnownNetwork>,
+    status: Option<SupplicantStatus>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PasswordFocus {
-    Input,
+enum BindBssidFocus {
+    Bind,
+    Candidate,
+    Cancel,
+    Connect,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BindBssidPopup {
+    target: WifiTarget,
+    bind_bssid: bool,
+    selected: usize,
+    focus: BindBssidFocus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CredentialFocus {
+    Ssid,
+    Bssid,
+    Security,
+    Identity,
+    Password,
+    Hidden,
     Show,
     Cancel,
     Connect,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct PasswordPopup {
+pub(crate) struct WifiCredentialsPopup {
     target: WifiTarget,
-    input: String,
+    ssid: String,
+    bssid: String,
+    security: Security,
+    identity: String,
+    password: String,
+    hidden: bool,
     show: bool,
-    focus: PasswordFocus,
+    choice: bool,
+    choice_selected: usize,
+    focus: CredentialFocus,
+}
+
+impl WifiCredentialsPopup {
+    fn security_index(security: Security) -> usize {
+        match security {
+            Security::Open => 0,
+            Security::Psk => 1,
+            Security::Eap => 2,
+            Security::Unknown => 0,
+        }
+    }
+
+    fn focus_order(&self) -> Vec<CredentialFocus> {
+        let mut fields = Vec::new();
+        if self.hidden {
+            fields.extend([CredentialFocus::Ssid, CredentialFocus::Bssid]);
+        }
+        fields.push(CredentialFocus::Security);
+        if self.security == Security::Eap {
+            fields.push(CredentialFocus::Identity);
+        }
+        if self.security != Security::Open {
+            fields.push(CredentialFocus::Password);
+        }
+        if self.hidden {
+            fields.push(CredentialFocus::Hidden);
+        }
+        if self.security != Security::Open {
+            fields.push(CredentialFocus::Show);
+        }
+        fields.extend([CredentialFocus::Cancel, CredentialFocus::Connect]);
+        fields
+    }
+
+    fn move_focus(&mut self, delta: isize) {
+        let order = self.focus_order();
+        let Some(index) = order.iter().position(|focus| *focus == self.focus)
+        else {
+            return;
+        };
+        self.focus = order[(index as isize + delta)
+            .clamp(0, order.len() as isize - 1)
+            as usize];
+    }
+
+    fn tab_focus(&mut self, backwards: bool) {
+        let order = self.focus_order();
+        let Some(index) = order.iter().position(|focus| *focus == self.focus)
+        else {
+            return;
+        };
+        let delta = if backwards { -1 } else { 1 };
+        self.focus = order[(index as isize + delta)
+            .rem_euclid(order.len() as isize)
+            as usize];
+    }
+
+    fn text_mut(&mut self) -> Option<&mut String> {
+        match self.focus {
+            CredentialFocus::Ssid => Some(&mut self.ssid),
+            CredentialFocus::Bssid => Some(&mut self.bssid),
+            CredentialFocus::Identity => Some(&mut self.identity),
+            CredentialFocus::Password => Some(&mut self.password),
+            _ => None,
+        }
+    }
+
+    fn toggle(&mut self) {
+        if self.focus == CredentialFocus::Hidden {
+            self.hidden = !self.hidden;
+        }
+    }
+
+    fn apply_security_choice(&mut self) {
+        self.choice = false;
+        self.security = match self.choice_selected {
+            1 => Security::Psk,
+            2 => Security::Eap,
+            _ => Security::Open,
+        };
+        if self.security == Security::Open {
+            self.identity.clear();
+            self.password.clear();
+        }
+        if !self.focus_order().contains(&self.focus) {
+            self.focus = if self.security == Security::Eap {
+                CredentialFocus::Identity
+            } else if self.security == Security::Psk {
+                CredentialFocus::Password
+            } else {
+                CredentialFocus::Cancel
+            };
+        }
+    }
+
+    fn validate(
+        &self,
+    ) -> Result<(WifiTarget, Option<String>, Option<String>), String> {
+        let ssid = if self.hidden {
+            self.ssid.trim().to_string()
+        } else {
+            self.target.ssid.clone()
+        };
+        if ssid.is_empty() {
+            return Err("SSID must not be empty".to_string());
+        }
+        let bssid =
+            if self.bssid.trim().is_empty() {
+                None
+            } else {
+                Some(self.bssid.trim().parse().map_err(|_| {
+                    "BSSID must be aa:bb:cc:dd:ee:ff".to_string()
+                })?)
+            };
+        if self.security == Security::Unknown {
+            return Err("Security type must be selected".to_string());
+        }
+        match self.security {
+            Security::Psk if !(8..=63).contains(&self.password.len()) => {
+                return Err(
+                    "WPA-PSK password must contain 8-63 bytes".to_string()
+                );
+            }
+            Security::Eap if self.identity.trim().is_empty() => {
+                return Err("EAP identity must not be empty".to_string());
+            }
+            Security::Eap if self.password.is_empty() => {
+                return Err("EAP password must not be empty".to_string());
+            }
+            _ => {}
+        }
+        let mut target = self.target.clone();
+        target.ssid = ssid;
+        target.bssid = bssid;
+        target.security = self.security;
+        target.hidden = self.hidden;
+        let password =
+            (!self.password.is_empty()).then(|| self.password.clone());
+        let identity =
+            (!self.identity.trim().is_empty()).then(|| self.identity.clone());
+        Ok((target, password, identity))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SavedNetworksFocus {
+    List,
+    Add,
+    Edit,
+    Delete,
+    Back,
+}
+
+impl SavedNetworksFocus {
+    fn index(self) -> usize {
+        match self {
+            Self::List => 0,
+            Self::Add => 1,
+            Self::Edit => 2,
+            Self::Delete => 3,
+            Self::Back => 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SavedNetworksPopup {
+    iface: String,
+    networks: Vec<KnownNetwork>,
+    selected: usize,
+    focus: SavedNetworksFocus,
+    parent: Box<ConnectionEditor>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccessPointFocus {
+    Ssid,
+    Bssid,
+    Security,
+    Identity,
+    Password,
+    Hidden,
+    Autoconnect,
+    Cancel,
+    Ok,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AccessPointEditorPopup {
+    iface: String,
+    original: Option<KnownNetwork>,
+    ssid: String,
+    bssid: String,
+    security: Security,
+    identity: String,
+    password: String,
+    hidden: bool,
+    autoconnect: bool,
+    focus: AccessPointFocus,
+    choice: bool,
+    choice_selected: usize,
+    footer: bool,
+    footer_selected: usize,
+    parent: Box<SavedNetworksPopup>,
+}
+
+impl AccessPointEditorPopup {
+    fn new(
+        iface: String,
+        original: Option<KnownNetwork>,
+        parent: Box<SavedNetworksPopup>,
+    ) -> Self {
+        let (ssid, bssid, security, identity, hidden, autoconnect) =
+            original.as_ref().map_or_else(
+                || {
+                    (
+                        String::new(),
+                        String::new(),
+                        Security::Psk,
+                        String::new(),
+                        false,
+                        true,
+                    )
+                },
+                |network| {
+                    (
+                        network.ssid.clone(),
+                        network
+                            .bssid
+                            .map(|bssid| bssid.to_string())
+                            .unwrap_or_default(),
+                        network.security,
+                        network.identity.clone().unwrap_or_default(),
+                        network.hidden,
+                        network.autoconnect,
+                    )
+                },
+            );
+        let focus = if security == Security::Eap {
+            AccessPointFocus::Identity
+        } else if security == Security::Psk {
+            AccessPointFocus::Password
+        } else {
+            AccessPointFocus::Ssid
+        };
+        Self {
+            iface,
+            original,
+            ssid,
+            bssid,
+            security,
+            identity,
+            password: String::new(),
+            hidden,
+            autoconnect,
+            focus,
+            choice: false,
+            choice_selected: Self::security_index(security),
+            footer: false,
+            footer_selected: 0,
+            parent,
+        }
+    }
+
+    fn security_index(security: Security) -> usize {
+        match security {
+            Security::Open => 0,
+            Security::Psk => 1,
+            Security::Eap => 2,
+            Security::Unknown => 0,
+        }
+    }
+
+    fn security_options() -> [&'static str; 3] {
+        ["None", "WPA & WPA2 Personal", "WPA & WPA2 Enterprise"]
+    }
+
+    fn focus_order(&self) -> Vec<AccessPointFocus> {
+        let mut fields = vec![
+            AccessPointFocus::Ssid,
+            AccessPointFocus::Bssid,
+            AccessPointFocus::Security,
+        ];
+        if self.security == Security::Eap {
+            fields.push(AccessPointFocus::Identity);
+        }
+        if self.security != Security::Open {
+            fields.push(AccessPointFocus::Password);
+        }
+        fields.extend([
+            AccessPointFocus::Hidden,
+            AccessPointFocus::Autoconnect,
+            AccessPointFocus::Cancel,
+            AccessPointFocus::Ok,
+        ]);
+        fields
+    }
+
+    fn move_focus(&mut self, delta: isize) {
+        let order = self.focus_order();
+        let index = order.iter().position(|focus| *focus == self.focus);
+        let Some(index) = index else { return };
+        self.focus = order[(index as isize + delta)
+            .clamp(0, order.len() as isize - 1)
+            as usize];
+    }
+
+    fn tab_focus(&mut self, backwards: bool) {
+        if self.footer {
+            self.footer = false;
+            return;
+        }
+        self.footer = true;
+        self.footer_selected = usize::from(backwards);
+    }
+
+    fn text_mut(&mut self) -> Option<&mut String> {
+        match self.focus {
+            AccessPointFocus::Ssid => Some(&mut self.ssid),
+            AccessPointFocus::Bssid => Some(&mut self.bssid),
+            AccessPointFocus::Identity => Some(&mut self.identity),
+            AccessPointFocus::Password => Some(&mut self.password),
+            _ => None,
+        }
+    }
+
+    fn toggle(&mut self) {
+        match self.focus {
+            AccessPointFocus::Hidden => self.hidden = !self.hidden,
+            AccessPointFocus::Autoconnect => {
+                self.autoconnect = !self.autoconnect
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_security_choice(&mut self) {
+        self.choice = false;
+        self.security = match self.choice_selected {
+            1 => Security::Psk,
+            2 => Security::Eap,
+            _ => Security::Open,
+        };
+        if self.security == Security::Open {
+            self.identity.clear();
+            self.password.clear();
+        }
+        if !self.focus_order().contains(&self.focus) {
+            self.focus = if self.security == Security::Eap {
+                AccessPointFocus::Identity
+            } else if self.security == Security::Psk {
+                AccessPointFocus::Password
+            } else {
+                AccessPointFocus::Hidden
+            };
+        }
+    }
+
+    fn validate(
+        &self,
+    ) -> Result<
+        (
+            String,
+            Option<MacAddr>,
+            Security,
+            Option<String>,
+            Option<String>,
+            bool,
+            bool,
+        ),
+        String,
+    > {
+        let ssid = self.ssid.trim().to_string();
+        if ssid.is_empty() {
+            return Err("SSID must not be empty".to_string());
+        }
+        let bssid =
+            if self.bssid.trim().is_empty() {
+                None
+            } else {
+                Some(self.bssid.trim().parse().map_err(|_| {
+                    "BSSID must be aa:bb:cc:dd:ee:ff".to_string()
+                })?)
+            };
+        if self.security == Security::Unknown {
+            return Err("Security type must be selected".to_string());
+        }
+        let password = if self.password.is_empty() {
+            None
+        } else {
+            Some(self.password.clone())
+        };
+        let identity = if self.identity.trim().is_empty() {
+            None
+        } else {
+            Some(self.identity.clone())
+        };
+        let is_new = self.original.is_none();
+        match self.security {
+            Security::Psk
+                if is_new
+                    && !password.as_ref().is_some_and(|password| {
+                        (8..=63).contains(&password.len())
+                    }) =>
+            {
+                return Err(
+                    "WPA-PSK password must contain 8-63 bytes".to_string()
+                );
+            }
+            Security::Psk
+                if password.as_ref().is_some_and(|password| {
+                    !(8..=63).contains(&password.len())
+                }) =>
+            {
+                return Err(
+                    "WPA-PSK password must contain 8-63 bytes".to_string()
+                );
+            }
+            Security::Eap if identity.is_none() => {
+                return Err("EAP identity must not be empty".to_string());
+            }
+            Security::Eap if is_new && password.is_none() => {
+                return Err("EAP password must not be empty".to_string());
+            }
+            _ => {}
+        }
+        Ok((
+            ssid,
+            bssid,
+            self.security,
+            password,
+            identity,
+            self.hidden,
+            self.autoconnect,
+        ))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -124,7 +601,6 @@ pub(crate) struct ConnectingPopup {
 #[derive(Debug, Clone)]
 enum EditTarget {
     Interface(String),
-    Network(KnownNetwork),
 }
 
 #[derive(Debug, Clone)]
@@ -210,6 +686,7 @@ enum EditorField {
     Identity,
     Password,
     Hidden,
+    SavedNetworks,
     Ipv4Mode,
     ListValue(ListField, usize),
     ListAdd(ListField),
@@ -514,7 +991,8 @@ pub struct ConnectionEditor {
     ipv6_required: bool,
     autoconnect: bool,
     available_users: bool,
-    existing_network: Option<(String, Option<MacAddr>)>,
+    existing_network: Option<(String, Option<MacAddr>, Security)>,
+    saved_networks: Vec<KnownNetwork>,
     focus: usize,
     list_action: ListAction,
     footer: bool,
@@ -525,12 +1003,23 @@ pub struct ConnectionEditor {
 
 impl ConnectionEditor {
     fn from_interface(iface: &InterfaceInfo) -> Self {
+        Self::from_interface_with_networks(iface, Vec::new())
+    }
+
+    fn from_interface_with_networks(
+        iface: &InterfaceInfo,
+        saved_networks: Vec<KnownNetwork>,
+    ) -> Self {
         let ipv4_addresses =
             iface.ipv4_addrs.iter().map(ToString::to_string).collect();
         let ipv6_addresses =
             iface.ipv6_addrs.iter().map(ToString::to_string).collect();
         Self {
-            mode: EditorMode::Ethernet,
+            mode: if iface.is_wlan() {
+                EditorMode::Wifi
+            } else {
+                EditorMode::Ethernet
+            },
             creation_kind: None,
             creation_parent: String::new(),
             creation_members: String::new(),
@@ -586,6 +1075,7 @@ impl ConnectionEditor {
             autoconnect: true,
             available_users: true,
             existing_network: None,
+            saved_networks,
             focus: 0,
             list_action: ListAction::Value,
             footer: false,
@@ -658,8 +1148,10 @@ impl ConnectionEditor {
             ipv6_required: false,
             autoconnect: known.is_none_or(KnownNetwork::is_enabled),
             available_users: true,
-            existing_network: known
-                .map(|network| (network.ssid.clone(), network.bssid)),
+            existing_network: known.map(|network| {
+                (network.ssid.clone(), network.bssid, network.security)
+            }),
+            saved_networks: Vec::new(),
             focus: 0,
             list_action: ListAction::Value,
             footer: false,
@@ -708,18 +1200,22 @@ impl ConnectionEditor {
             Some(_) | None => {}
         }
         if self.mode == EditorMode::Wifi {
-            fields.extend([
-                EditorField::Ssid,
-                EditorField::Bssid,
-                EditorField::Security,
-            ]);
-            if self.security == Security::Eap {
-                fields.push(EditorField::Identity);
+            if self.creation_kind.is_none() {
+                fields.push(EditorField::SavedNetworks);
+            } else {
+                fields.extend([
+                    EditorField::Ssid,
+                    EditorField::Bssid,
+                    EditorField::Security,
+                ]);
+                if self.security == Security::Eap {
+                    fields.push(EditorField::Identity);
+                }
+                if self.security != Security::Open {
+                    fields.push(EditorField::Password);
+                }
+                fields.push(EditorField::Hidden);
             }
-            if self.security != Security::Open {
-                fields.push(EditorField::Password);
-            }
-            fields.push(EditorField::Hidden);
         }
         fields.extend([EditorField::Ipv4Mode]);
         fields.extend(self.list_fields(ListField::Ipv4Addresses));
@@ -778,6 +1274,7 @@ impl ConnectionEditor {
             EditorField::Identity => "Identity",
             EditorField::Password => "Password",
             EditorField::Hidden => "Hidden network",
+            EditorField::SavedNetworks => "Saved Networks",
             EditorField::Ipv4Mode => "IPv4 CONFIGURATION",
             EditorField::ListValue(kind, _) | EditorField::ListAdd(kind) => {
                 kind.label()
@@ -1369,39 +1866,49 @@ impl ConnectionEditor {
                 None,
                 Line::from(Span::styled("- WI-FI", section_style())),
             ));
-            push_field!(EditorField::Ssid, self.field_line(EditorField::Ssid));
-            push_field!(
-                EditorField::Bssid,
-                self.field_line(EditorField::Bssid)
-            );
-            push_field!(
-                EditorField::Security,
-                self.selection_line(
+            if self.creation_kind.is_none() {
+                push_field!(
+                    EditorField::SavedNetworks,
+                    self.selection_line(EditorField::SavedNetworks, "Edit..."),
+                );
+            } else {
+                push_field!(
+                    EditorField::Ssid,
+                    self.field_line(EditorField::Ssid),
+                );
+                push_field!(
+                    EditorField::Bssid,
+                    self.field_line(EditorField::Bssid)
+                );
+                push_field!(
                     EditorField::Security,
-                    match self.security {
-                        Security::Open => "None",
-                        Security::Psk => "WPA & WPA2 Personal",
-                        Security::Eap => "WPA & WPA2 Enterprise",
-                        Security::Unknown => "None",
-                    },
-                ),
-            );
-            if self.security == Security::Eap {
+                    self.selection_line(
+                        EditorField::Security,
+                        match self.security {
+                            Security::Open => "None",
+                            Security::Psk => "WPA & WPA2 Personal",
+                            Security::Eap => "WPA & WPA2 Enterprise",
+                            Security::Unknown => "None",
+                        },
+                    ),
+                );
+                if self.security == Security::Eap {
+                    push_field!(
+                        EditorField::Identity,
+                        self.field_line(EditorField::Identity),
+                    );
+                }
+                if self.security != Security::Open {
+                    push_field!(
+                        EditorField::Password,
+                        self.field_line(EditorField::Password),
+                    );
+                }
                 push_field!(
-                    EditorField::Identity,
-                    self.field_line(EditorField::Identity),
+                    EditorField::Hidden,
+                    self.checkbox_line(EditorField::Hidden),
                 );
             }
-            if self.security != Security::Open {
-                push_field!(
-                    EditorField::Password,
-                    self.field_line(EditorField::Password),
-                );
-            }
-            push_field!(
-                EditorField::Hidden,
-                self.checkbox_line(EditorField::Hidden),
-            );
         } else {
             rows.push((
                 None,
@@ -1738,6 +2245,9 @@ pub struct App {
     pub scan_results: Vec<ScanResult>,
     pub known_networks: Vec<KnownNetwork>,
     pub wifi_status: Option<SupplicantStatus>,
+    /// Per-interface Wi-Fi state. The public fields above remain as a
+    /// compatibility view for callers that only manage one WLAN.
+    wifi_by_interface: BTreeMap<String, WifiInterfaceState>,
     pub main_selected: usize,
     pub main_focus: usize,
     pub edit_selected: usize,
@@ -1758,6 +2268,7 @@ impl Default for App {
             scan_results: Vec::new(),
             known_networks: Vec::new(),
             wifi_status: None,
+            wifi_by_interface: BTreeMap::new(),
             main_selected: 0,
             main_focus: 0,
             edit_selected: 0,
@@ -1856,52 +2367,120 @@ impl App {
     }
 
     fn refresh_wifi(&mut self, client: &mut DaemonClient, scan: bool) {
-        let Some(iface) = self.first_wifi() else {
+        let wifi_interfaces = self
+            .interfaces
+            .iter()
+            .filter(|interface| interface.is_wlan())
+            .cloned()
+            .collect::<Vec<_>>();
+        if wifi_interfaces.is_empty() {
             return;
-        };
-        self.wifi_iface = Some(iface.clone());
-        if scan {
-            let command = DaemonCommand::WiFiManager {
+        }
+        self.wifi_iface = self
+            .wifi_iface
+            .clone()
+            .filter(|name| wifi_interfaces.iter().any(|i| i.name == *name))
+            .or_else(|| wifi_interfaces.first().map(|i| i.name.clone()));
+
+        for interface in wifi_interfaces {
+            let iface = interface.name.clone();
+            if scan {
+                let command = DaemonCommand::WiFiManager {
+                    iface: iface.clone(),
+                    action: WiFiManagerAction::Scan,
+                };
+                let _ = client.request(&command);
+            }
+            let scan_command = DaemonCommand::WiFiManager {
                 iface: iface.clone(),
-                action: WiFiManagerAction::Scan,
+                action: WiFiManagerAction::ScanResults,
             };
-            let _ = self.request(client, &command);
+            if let Ok(DaemonResponse::WiFiManager {
+                response: WiFiManagerResponse::ScanResults(mut results),
+                ..
+            }) = client.request(&scan_command)
+            {
+                results.sort_by_key(|result| Reverse(result.signal));
+                self.wifi_by_interface
+                    .entry(iface.clone())
+                    .or_default()
+                    .scan_results = results;
+            }
+            let status_command = DaemonCommand::WiFiManager {
+                iface: iface.clone(),
+                action: WiFiManagerAction::Status,
+            };
+            if let Ok(DaemonResponse::WiFiManager {
+                response: WiFiManagerResponse::Status(status),
+                ..
+            }) = client.request(&status_command)
+            {
+                self.wifi_by_interface
+                    .entry(iface.clone())
+                    .or_default()
+                    .status = Some(status);
+            }
+            let known_command = DaemonCommand::WiFiManager {
+                iface: iface.clone(),
+                action: WiFiManagerAction::KnownNetworks,
+            };
+            if let Ok(DaemonResponse::WiFiManager {
+                response: WiFiManagerResponse::KnownNetworks(mut networks),
+                ..
+            }) = client.request(&known_command)
+            {
+                networks.sort_by_key(|network| {
+                    (Reverse(network.priority), network.ssid.clone())
+                });
+                self.wifi_by_interface
+                    .entry(iface.clone())
+                    .or_default()
+                    .known_networks = networks;
+            }
+            self.wifi_by_interface.entry(iface).or_default().mac =
+                interface.mac_addr;
         }
-        let scan_command = DaemonCommand::WiFiManager {
-            iface: iface.clone(),
-            action: WiFiManagerAction::ScanResults,
-        };
-        if let Ok(DaemonResponse::WiFiManager {
-            response: WiFiManagerResponse::ScanResults(mut results),
-            ..
-        }) = self.request(client, &scan_command)
+
+        if let Some(iface) = self.first_wifi()
+            && let Some(state) = self.wifi_by_interface.get(&iface)
         {
-            results.sort_by_key(|result| Reverse(result.signal));
-            self.scan_results = results;
+            self.scan_results = state.scan_results.clone();
+            self.known_networks = state.known_networks.clone();
+            self.wifi_status = state.status.clone();
         }
-        let status_command = DaemonCommand::WiFiManager {
-            iface: iface.clone(),
-            action: WiFiManagerAction::Status,
-        };
-        if let Ok(DaemonResponse::WiFiManager {
-            response: WiFiManagerResponse::Status(status),
-            ..
-        }) = self.request(client, &status_command)
-        {
-            self.wifi_status = Some(status);
+    }
+
+    fn scan_for_interface(&self, iface: &str) -> Vec<ScanResult> {
+        if let Some(state) = self.wifi_by_interface.get(iface) {
+            return state.scan_results.clone();
         }
-        let known_command = DaemonCommand::WiFiManager {
-            iface,
-            action: WiFiManagerAction::KnownNetworks,
-        };
-        if let Ok(DaemonResponse::WiFiManager {
-            response: WiFiManagerResponse::KnownNetworks(mut networks),
-            ..
-        }) = self.request(client, &known_command)
-        {
-            networks.sort_by_key(|network| Reverse(network.priority));
-            self.known_networks = networks;
+        if self.first_wifi().as_deref() == Some(iface) {
+            self.scan_results.clone()
+        } else {
+            Vec::new()
         }
+    }
+
+    fn known_for_interface(&self, iface: &str) -> Vec<KnownNetwork> {
+        if let Some(state) = self.wifi_by_interface.get(iface) {
+            return state.known_networks.clone();
+        }
+        if self.first_wifi().as_deref() == Some(iface) {
+            self.known_networks.clone()
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn status_for_interface(&self, iface: &str) -> Option<&SupplicantStatus> {
+        self.wifi_by_interface
+            .get(iface)
+            .and_then(|state| state.status.as_ref())
+            .or_else(|| {
+                (self.first_wifi().as_deref() == Some(iface))
+                    .then_some(self.wifi_status.as_ref())
+                    .flatten()
+            })
     }
 
     fn edit_rows(&self) -> Vec<EditRow> {
@@ -1933,19 +2512,28 @@ impl App {
             label: "Wi-Fi".to_string(),
             target: None,
         });
-        if self.known_networks.is_empty() {
+        let wireless = self
+            .interfaces
+            .iter()
+            .filter(|interface| interface.is_wlan())
+            .collect::<Vec<_>>();
+        if wireless.is_empty() {
             rows.push(EditRow {
                 label: "  (no saved connections)".to_string(),
                 target: None,
             });
         } else {
-            rows.extend(self.known_networks.iter().map(|network| EditRow {
+            rows.extend(wireless.into_iter().map(|interface| EditRow {
                 label: format!(
                     "  {}{}",
-                    if network.is_current() { "* " } else { "" },
-                    network.ssid
+                    if interface.state.is_online() {
+                        "* "
+                    } else {
+                        ""
+                    },
+                    interface.name
                 ),
-                target: Some(EditTarget::Network(network.clone())),
+                target: Some(EditTarget::Interface(interface.name.clone())),
             }));
         }
         rows.push(EditRow {
@@ -1996,35 +2584,104 @@ impl App {
             target: None,
             active: false,
         });
-        if self.scan_results.is_empty() {
+        let wireless = self
+            .interfaces
+            .iter()
+            .filter(|interface| interface.is_wlan())
+            .collect::<Vec<_>>();
+        if wireless.is_empty() {
             rows.push(ActivationRow {
-                label: "  (no wireless networks found)".to_string(),
+                label: "  (no wireless interfaces found)".to_string(),
                 signal: None,
                 target: None,
                 active: false,
             });
-        } else if let Some(iface) = self.first_wifi() {
-            rows.extend(self.scan_results.iter().map(|network| {
-                let target = WifiTarget {
-                    iface: iface.clone(),
-                    ssid: network.ssid.clone(),
-                    bssid: Some(network.bssid),
-                    security: network.security,
-                    hidden: false,
-                };
-                let active = self.is_current_wifi_target(&target);
-                ActivationRow {
-                    label: format!(
-                        "  {}{}  {}",
-                        if active { "* " } else { "" },
-                        network.ssid,
-                        network.security
-                    ),
-                    signal: Some(network.signal),
-                    target: Some(ActivationTarget::Wifi(target)),
-                    active,
+        } else {
+            for interface in wireless {
+                let iface = interface.name.clone();
+                rows.push(ActivationRow {
+                    label: format!("  {iface}"),
+                    signal: None,
+                    target: None,
+                    active: false,
+                });
+                let mut groups: Vec<(String, Security, Vec<ScanResult>)> =
+                    Vec::new();
+                let mut hidden = Vec::new();
+                for scan in self.scan_for_interface(&iface) {
+                    if scan.ssid.is_empty() {
+                        hidden.push(scan);
+                        continue;
+                    }
+                    if let Some((_, _, results)) =
+                        groups.iter_mut().find(|(ssid, security, _)| {
+                            *ssid == scan.ssid && *security == scan.security
+                        })
+                    {
+                        results.push(scan);
+                    } else {
+                        groups.push((
+                            scan.ssid.clone(),
+                            scan.security,
+                            vec![scan],
+                        ));
+                    }
                 }
-            }));
+                if !hidden.is_empty() {
+                    groups.push((String::new(), Security::Unknown, hidden));
+                }
+                groups.sort_by_key(|(_, _, results)| {
+                    Reverse(
+                        results
+                            .iter()
+                            .map(|result| result.signal)
+                            .max()
+                            .unwrap_or(-100),
+                    )
+                });
+                if groups.is_empty() {
+                    rows.push(ActivationRow {
+                        label: "    (no wireless networks found)".to_string(),
+                        signal: None,
+                        target: None,
+                        active: false,
+                    });
+                } else {
+                    for (ssid, security, mut candidates) in groups {
+                        candidates.sort_by_key(|result| Reverse(result.signal));
+                        let signal =
+                            candidates.first().map(|result| result.signal);
+                        let target = WifiTarget {
+                            iface: iface.clone(),
+                            ssid: ssid.clone(),
+                            bssid: None,
+                            security,
+                            hidden: ssid.is_empty(),
+                            candidates,
+                        };
+                        let active = self.is_current_wifi_target(&target);
+                        let label = if target.hidden {
+                            format!(
+                                "    {}<Hidden> N/A",
+                                if active { "* " } else { "" }
+                            )
+                        } else {
+                            format!(
+                                "    {}{}  {}",
+                                if active { "* " } else { "" },
+                                target.ssid,
+                                target.security
+                            )
+                        };
+                        rows.push(ActivationRow {
+                            label,
+                            signal,
+                            target: Some(ActivationTarget::Wifi(target)),
+                            active,
+                        });
+                    }
+                }
+            }
         }
         rows.push(ActivationRow {
             label: "Bluetooth".to_string(),
@@ -2042,10 +2699,11 @@ impl App {
     }
 
     fn is_current_wifi_target(&self, target: &WifiTarget) -> bool {
-        self.wifi_status.as_ref().is_some_and(|status| {
-            status.state == Some(WpaState::Completed)
-                && status.ssid.as_deref() == Some(target.ssid.as_str())
-        })
+        self.status_for_interface(&target.iface)
+            .is_some_and(|status| {
+                status.state == Some(WpaState::Completed)
+                    && status.ssid.as_deref() == Some(target.ssid.as_str())
+            })
     }
 
     fn move_main(&mut self, delta: isize) {
@@ -2181,50 +2839,37 @@ impl App {
                     .find(|interface| interface.name == name)
                 {
                     self.popup = Popup::Editor(Box::new(
-                        ConnectionEditor::from_interface(interface),
+                        ConnectionEditor::from_interface_with_networks(
+                            interface,
+                            self.known_for_interface(&name),
+                        ),
                     ));
                 }
-            }
-            EditTarget::Network(network) => {
-                let Some(iface) = self.first_wifi() else {
-                    self.show_message(
-                        "Cannot edit connection",
-                        "No Wi-Fi interface is available",
-                    );
-                    return;
-                };
-                self.popup = Popup::Editor(Box::new(
-                    ConnectionEditor::from_wifi(&iface, None, Some(&network)),
-                ));
             }
         }
     }
 
     fn delete_edit(&mut self, client: &mut DaemonClient) {
         let rows = self.edit_rows();
-        let Some(EditTarget::Network(network)) = rows
+        let Some(EditTarget::Interface(name)) = rows
             .get(self.edit_selected)
             .and_then(|row| row.target.clone())
         else {
             self.show_message(
                 "Delete connection",
-                "Only saved Wi-Fi connections can be deleted here",
+                "Select an interface connection first",
             );
             return;
         };
-        let command = DaemonCommand::WiFiManager {
-            iface: self.first_wifi().unwrap_or_default(),
-            action: WiFiManagerAction::RemoveNetwork {
-                ssid: network.ssid,
-                bssid: network.bssid,
-            },
+        let command = DaemonCommand::InterfaceManager {
+            action: InterfaceManagerAction::DelLink { name: name.clone() },
         };
         match self.request(client, &command) {
             Ok(_) => {
-                self.refresh_wifi(client, false);
+                self.refresh_interfaces(client);
                 self.edit_selected = self.edit_selected.saturating_sub(1);
             }
-            Err(error) => self.show_error("Delete connection failed", error),
+            Err(error) => self.show_error("Delete interface failed", error),
         }
     }
 
@@ -2365,7 +3010,7 @@ impl App {
                 if row.active {
                     self.disconnect_wifi(client, target.iface);
                 } else {
-                    self.start_wifi(client, target, None);
+                    self.open_wifi_connection(target);
                 }
             }
         }
@@ -2391,29 +3036,89 @@ impl App {
             .map_or("Activate", |_| "Deactivate")
     }
 
+    fn open_wifi_connection(&mut self, target: WifiTarget) {
+        self.popup = Popup::BindBssid(BindBssidPopup {
+            target,
+            bind_bssid: false,
+            selected: 0,
+            focus: BindBssidFocus::Bind,
+        });
+    }
+
+    fn known_network_for_target(
+        &self,
+        target: &WifiTarget,
+    ) -> Option<KnownNetwork> {
+        self.known_for_interface(&target.iface)
+            .into_iter()
+            .find(|network| {
+                network.ssid == target.ssid
+                    && network.security == target.security
+                    && (target.bssid.is_none()
+                        || network.bssid.is_none()
+                        || network.bssid == target.bssid)
+            })
+    }
+
+    fn open_wifi_credentials(
+        &mut self,
+        target: WifiTarget,
+        bssid: Option<MacAddr>,
+    ) {
+        let hidden = target.hidden;
+        let security = target.security;
+        let focus = if hidden {
+            CredentialFocus::Ssid
+        } else if security == Security::Unknown {
+            CredentialFocus::Security
+        } else if security == Security::Eap {
+            CredentialFocus::Identity
+        } else {
+            CredentialFocus::Password
+        };
+        self.popup = Popup::WifiCredentials(WifiCredentialsPopup {
+            ssid: if hidden {
+                String::new()
+            } else {
+                target.ssid.clone()
+            },
+            bssid: bssid.map(|value| value.to_string()).unwrap_or_default(),
+            security,
+            identity: String::new(),
+            password: String::new(),
+            hidden,
+            show: false,
+            choice: false,
+            choice_selected: WifiCredentialsPopup::security_index(security),
+            target,
+            focus,
+        });
+    }
+
     fn start_wifi(
         &mut self,
         client: &mut DaemonClient,
         target: WifiTarget,
         password: Option<String>,
+        identity: Option<String>,
     ) {
-        let known = self.known_networks.iter().find(|network| {
-            network.ssid == target.ssid
-                && (network.bssid.is_none() || network.bssid == target.bssid)
-        });
-        if password.is_none()
-            && known.is_none()
-            && target.security != Security::Open
-        {
-            self.popup = Popup::Password(PasswordPopup {
-                target,
-                input: String::new(),
-                show: false,
-                focus: PasswordFocus::Input,
-            });
+        let known = self.known_network_for_target(&target);
+        let has_user_credentials = password.is_some()
+            || identity.as_ref().is_some_and(|v| !v.is_empty());
+        let needs_credentials = (target.hidden
+            && target.ssid.trim().is_empty())
+            || target.security == Security::Unknown
+            || (known.is_none()
+                && target.security == Security::Psk
+                && password.is_none())
+            || (known.is_none()
+                && target.security == Security::Eap
+                && (identity.is_none() || password.is_none()));
+        if needs_credentials && !has_user_credentials {
+            self.open_wifi_credentials(target, None);
             return;
         }
-        if known.is_none() {
+        if known.is_none() || has_user_credentials || target.hidden {
             let add_command = DaemonCommand::WiFiManager {
                 iface: target.iface.clone(),
                 action: WiFiManagerAction::AddNetwork {
@@ -2421,12 +3126,9 @@ impl App {
                     bssid: target.bssid,
                     security: target.security,
                     password,
-                    identity: if target.security == Security::Eap {
-                        Some("user".to_string())
-                    } else {
-                        None
-                    },
+                    identity,
                     hidden: target.hidden,
+                    autoconnect: true,
                 },
             };
             if let Err(error) = self.request(client, &add_command) {
@@ -2439,6 +3141,7 @@ impl App {
             action: WiFiManagerAction::Connect {
                 ssid: target.ssid.clone(),
                 bssid: target.bssid,
+                security: Some(target.security),
             },
         };
         match self.request(client, &connect_command) {
@@ -2517,6 +3220,35 @@ impl App {
                 self.refresh_interfaces(client);
             }
             EditorMode::Wifi => {
+                if editor.creation_kind.is_none() {
+                    let name = editor.device.trim().to_string();
+                    if name.is_empty() {
+                        self.show_message(
+                            "Invalid connection",
+                            "Device must not be empty",
+                        );
+                        return;
+                    }
+                    let actions = match editor.interface_actions(name) {
+                        Ok(actions) => actions,
+                        Err(error) => {
+                            self.show_message("Invalid connection", error);
+                            return;
+                        }
+                    };
+                    for action in actions {
+                        let command =
+                            DaemonCommand::InterfaceManager { action };
+                        if let Err(error) = self.request(client, &command) {
+                            self.show_error("Save connection failed", error);
+                            return;
+                        }
+                    }
+                    self.popup = Popup::None;
+                    self.refresh_interfaces(client);
+                    self.refresh_wifi(client, false);
+                    return;
+                }
                 let (ssid, bssid, security) = match editor.wifi_values() {
                     Ok(values) => values,
                     Err(error) => {
@@ -2586,7 +3318,7 @@ impl App {
                     }
                     self.wifi_iface = Some(iface.clone());
                 }
-                if let Some((old_ssid, old_bssid)) =
+                if let Some((old_ssid, old_bssid, old_security)) =
                     editor.existing_network.clone()
                 {
                     let remove = DaemonCommand::WiFiManager {
@@ -2594,6 +3326,7 @@ impl App {
                         action: WiFiManagerAction::RemoveNetwork {
                             ssid: old_ssid,
                             bssid: old_bssid,
+                            security: Some(old_security),
                         },
                     };
                     if let Err(error) = self.request(client, &remove) {
@@ -2618,6 +3351,7 @@ impl App {
                             Some(editor.identity.clone())
                         },
                         hidden: editor.hidden,
+                        autoconnect: editor.autoconnect,
                     },
                 };
                 match self.request(client, &add) {
@@ -2645,6 +3379,125 @@ impl App {
                     }
                 }
             }
+        }
+    }
+
+    fn open_saved_networks(&mut self, editor: ConnectionEditor) {
+        let iface = editor.device.clone();
+        self.popup = Popup::SavedNetworks(SavedNetworksPopup {
+            iface,
+            networks: editor.saved_networks.clone(),
+            selected: 0,
+            focus: SavedNetworksFocus::List,
+            parent: Box::new(editor),
+        });
+    }
+
+    fn open_access_point_editor(
+        &mut self,
+        parent: SavedNetworksPopup,
+        original: Option<KnownNetwork>,
+    ) {
+        let iface = parent.iface.clone();
+        self.popup = Popup::AccessPointEditor(AccessPointEditorPopup::new(
+            iface,
+            original,
+            Box::new(parent),
+        ));
+    }
+
+    fn save_access_point(
+        &mut self,
+        client: &mut DaemonClient,
+        editor: AccessPointEditorPopup,
+    ) {
+        let values = match editor.validate() {
+            Ok(values) => values,
+            Err(error) => {
+                self.show_message("Invalid saved network", error);
+                return;
+            }
+        };
+        let (ssid, bssid, security, password, identity, hidden, autoconnect) =
+            values;
+        let original_key = editor.original.as_ref().map(|network| {
+            (network.ssid.clone(), network.bssid, network.security)
+        });
+        let new_key = (ssid.clone(), bssid, security);
+        if let Some((old_ssid, old_bssid, old_security)) = original_key
+            && (old_ssid.clone(), old_bssid, old_security) != new_key
+        {
+            let remove = DaemonCommand::WiFiManager {
+                iface: editor.iface.clone(),
+                action: WiFiManagerAction::RemoveNetwork {
+                    ssid: old_ssid,
+                    bssid: old_bssid,
+                    security: Some(old_security),
+                },
+            };
+            if let Err(error) = self.request(client, &remove) {
+                self.show_error("Saved network update failed", error);
+                return;
+            }
+        }
+        let add = DaemonCommand::WiFiManager {
+            iface: editor.iface.clone(),
+            action: WiFiManagerAction::AddNetwork {
+                ssid,
+                bssid,
+                security,
+                password,
+                identity,
+                hidden,
+                autoconnect,
+            },
+        };
+        match self.request(client, &add) {
+            Ok(_) => {
+                let mut parent = *editor.parent;
+                self.refresh_wifi(client, false);
+                let networks = self.known_for_interface(&editor.iface);
+                if !networks.is_empty()
+                    || self.wifi_by_interface.contains_key(&editor.iface)
+                {
+                    parent.networks = networks.clone();
+                    parent.parent.saved_networks = networks;
+                }
+                parent.focus = SavedNetworksFocus::List;
+                self.popup = Popup::SavedNetworks(parent);
+            }
+            Err(error) => self.show_error("Save saved network failed", error),
+        }
+    }
+
+    fn delete_saved_network(
+        &mut self,
+        client: &mut DaemonClient,
+        mut popup: SavedNetworksPopup,
+    ) {
+        let Some(network) = popup.networks.get(popup.selected).cloned() else {
+            self.popup = Popup::SavedNetworks(popup);
+            return;
+        };
+        let command = DaemonCommand::WiFiManager {
+            iface: popup.iface.clone(),
+            action: WiFiManagerAction::RemoveNetwork {
+                ssid: network.ssid,
+                bssid: network.bssid,
+                security: Some(network.security),
+            },
+        };
+        match self.request(client, &command) {
+            Ok(_) => {
+                self.refresh_wifi(client, false);
+                let networks = self.known_for_interface(&popup.iface);
+                popup.networks = networks.clone();
+                popup.parent.saved_networks = networks;
+                popup.selected =
+                    popup.selected.min(popup.networks.len().saturating_sub(1));
+                self.popup = Popup::SavedNetworks(popup);
+            }
+            Err(error) => self.show_error("Delete saved network failed", error),
         }
     }
 
@@ -2819,6 +3672,420 @@ impl App {
         false
     }
 
+    fn handle_bind_bssid_key(
+        &mut self,
+        key: crossterm::event::KeyCode,
+        client: &mut DaemonClient,
+    ) {
+        use crossterm::event::KeyCode;
+        let popup = std::mem::replace(&mut self.popup, Popup::None);
+        let Popup::BindBssid(mut popup) = popup else {
+            self.popup = popup;
+            return;
+        };
+        let order = if popup.bind_bssid {
+            vec![
+                BindBssidFocus::Bind,
+                BindBssidFocus::Candidate,
+                BindBssidFocus::Cancel,
+                BindBssidFocus::Connect,
+            ]
+        } else {
+            vec![
+                BindBssidFocus::Bind,
+                BindBssidFocus::Cancel,
+                BindBssidFocus::Connect,
+            ]
+        };
+        if !order.contains(&popup.focus) {
+            popup.focus = BindBssidFocus::Bind;
+        }
+        let mut close = false;
+        let mut connect = false;
+        match key {
+            KeyCode::Up | KeyCode::Down => {
+                if popup.focus == BindBssidFocus::Candidate {
+                    if !popup.target.candidates.is_empty() {
+                        let delta = if key == KeyCode::Up { -1 } else { 1 };
+                        popup.selected = (popup.selected as isize + delta)
+                            .rem_euclid(popup.target.candidates.len() as isize)
+                            as usize;
+                    }
+                    self.popup = Popup::BindBssid(popup);
+                    return;
+                }
+                let index = order
+                    .iter()
+                    .position(|focus| *focus == popup.focus)
+                    .unwrap_or(0);
+                let delta = if key == KeyCode::Up { -1 } else { 1 };
+                popup.focus = order[(index as isize + delta)
+                    .clamp(0, order.len() as isize - 1)
+                    as usize];
+                if popup.focus == BindBssidFocus::Candidate
+                    && popup.target.candidates.is_empty()
+                {
+                    popup.focus = BindBssidFocus::Bind;
+                }
+            }
+            KeyCode::Left | KeyCode::Right
+                if popup.focus == BindBssidFocus::Bind =>
+            {
+                popup.bind_bssid = !popup.bind_bssid;
+                if !popup.bind_bssid {
+                    popup.focus = BindBssidFocus::Bind;
+                }
+            }
+            KeyCode::Left | KeyCode::Right
+                if matches!(
+                    popup.focus,
+                    BindBssidFocus::Cancel | BindBssidFocus::Connect
+                ) =>
+            {
+                popup.focus = match popup.focus {
+                    BindBssidFocus::Cancel => BindBssidFocus::Connect,
+                    BindBssidFocus::Connect => BindBssidFocus::Cancel,
+                    _ => popup.focus,
+                };
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                let index = order
+                    .iter()
+                    .position(|focus| *focus == popup.focus)
+                    .unwrap_or(0);
+                let delta = if key == KeyCode::BackTab { -1 } else { 1 };
+                popup.focus = order[(index as isize + delta)
+                    .rem_euclid(order.len() as isize)
+                    as usize];
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => match popup.focus {
+                BindBssidFocus::Bind => {
+                    popup.bind_bssid = !popup.bind_bssid;
+                    if !popup.bind_bssid {
+                        popup.focus = BindBssidFocus::Bind;
+                    }
+                }
+                BindBssidFocus::Candidate => {}
+                BindBssidFocus::Cancel => close = true,
+                BindBssidFocus::Connect => connect = true,
+            },
+            KeyCode::Esc => close = true,
+            _ => {}
+        }
+        if close {
+            self.popup = Popup::None;
+        } else if connect {
+            if popup.bind_bssid && popup.target.candidates.is_empty() {
+                self.popup = Popup::Message(MessagePopup {
+                    title: "Bind BSSID".to_string(),
+                    message: "No access point is available to bind".to_string(),
+                });
+                return;
+            }
+            let mut target = popup.target;
+            target.bssid = if popup.bind_bssid {
+                target
+                    .candidates
+                    .get(popup.selected)
+                    .map(|candidate| candidate.bssid)
+            } else {
+                None
+            };
+            self.start_wifi(client, target, None, None);
+        } else {
+            if popup.focus == BindBssidFocus::Candidate
+                && !popup.target.candidates.is_empty()
+            {
+                popup.selected = popup
+                    .selected
+                    .min(popup.target.candidates.len().saturating_sub(1));
+            }
+            self.popup = Popup::BindBssid(popup);
+        }
+    }
+
+    fn handle_wifi_credentials_key(
+        &mut self,
+        key: crossterm::event::KeyCode,
+        client: &mut DaemonClient,
+    ) {
+        use crossterm::event::KeyCode;
+        let popup = std::mem::replace(&mut self.popup, Popup::None);
+        let Popup::WifiCredentials(mut popup) = popup else {
+            self.popup = popup;
+            return;
+        };
+        let mut submit = None;
+        let mut cancel = false;
+        if popup.choice {
+            match key {
+                KeyCode::Up => {
+                    popup.choice_selected =
+                        popup.choice_selected.saturating_sub(1)
+                }
+                KeyCode::Down => {
+                    popup.choice_selected = (popup.choice_selected + 1).min(2)
+                }
+                KeyCode::Enter => popup.apply_security_choice(),
+                KeyCode::Esc => popup.choice = false,
+                _ => {}
+            }
+        } else {
+            match key {
+                KeyCode::Up | KeyCode::Down => {
+                    popup.move_focus(if key == KeyCode::Up { -1 } else { 1 });
+                }
+                KeyCode::Tab | KeyCode::BackTab => {
+                    popup.tab_focus(key == KeyCode::BackTab);
+                }
+                KeyCode::Left | KeyCode::Right
+                    if matches!(
+                        popup.focus,
+                        CredentialFocus::Cancel | CredentialFocus::Connect
+                    ) =>
+                {
+                    popup.focus = match popup.focus {
+                        CredentialFocus::Cancel => CredentialFocus::Connect,
+                        CredentialFocus::Connect => CredentialFocus::Cancel,
+                        _ => popup.focus,
+                    };
+                }
+                KeyCode::Char(character)
+                    if popup.focus != CredentialFocus::Show
+                        && popup.focus != CredentialFocus::Hidden
+                        && popup.focus != CredentialFocus::Security
+                        && popup.text_mut().is_some() =>
+                {
+                    if let Some(value) = popup.text_mut() {
+                        value.push(character);
+                    }
+                }
+                KeyCode::Backspace => {
+                    if let Some(value) = popup.text_mut() {
+                        value.pop();
+                    }
+                }
+                KeyCode::Char(' ') => match popup.focus {
+                    CredentialFocus::Show => popup.show = !popup.show,
+                    CredentialFocus::Hidden => popup.toggle(),
+                    _ => {}
+                },
+                KeyCode::Enter => match popup.focus {
+                    CredentialFocus::Security => {
+                        popup.choice = true;
+                    }
+                    CredentialFocus::Show | CredentialFocus::Hidden => {
+                        if popup.focus == CredentialFocus::Show {
+                            popup.show = !popup.show;
+                        } else {
+                            popup.toggle();
+                        }
+                    }
+                    CredentialFocus::Cancel => cancel = true,
+                    CredentialFocus::Connect => {
+                        submit = Some(popup.validate());
+                    }
+                    _ => {}
+                },
+                KeyCode::Esc => cancel = true,
+                _ => {}
+            }
+        }
+        if cancel {
+            self.popup = Popup::None;
+        } else if let Some(result) = submit {
+            match result {
+                Ok((target, password, identity)) => {
+                    self.start_wifi(client, target, password, identity);
+                }
+                Err(error) => {
+                    self.popup = Popup::Message(MessagePopup {
+                        title: "Invalid Wi-Fi credentials".to_string(),
+                        message: error,
+                    });
+                }
+            }
+        } else {
+            self.popup = Popup::WifiCredentials(popup);
+        }
+    }
+
+    fn handle_saved_networks_key(
+        &mut self,
+        key: crossterm::event::KeyCode,
+        client: &mut DaemonClient,
+    ) {
+        use crossterm::event::KeyCode;
+        let popup = std::mem::replace(&mut self.popup, Popup::None);
+        let Popup::SavedNetworks(mut popup) = popup else {
+            self.popup = popup;
+            return;
+        };
+        let order = [
+            SavedNetworksFocus::List,
+            SavedNetworksFocus::Add,
+            SavedNetworksFocus::Edit,
+            SavedNetworksFocus::Delete,
+            SavedNetworksFocus::Back,
+        ];
+        let mut open_add = false;
+        let mut open_edit = false;
+        let mut delete = false;
+        let mut back = false;
+        match key {
+            KeyCode::Up | KeyCode::Down => {
+                if popup.focus == SavedNetworksFocus::List {
+                    if !popup.networks.is_empty() {
+                        let delta = if key == KeyCode::Up { -1 } else { 1 };
+                        popup.selected = (popup.selected as isize + delta)
+                            .rem_euclid(popup.networks.len() as isize)
+                            as usize;
+                    }
+                    self.popup = Popup::SavedNetworks(popup);
+                    return;
+                }
+                let index = order
+                    .iter()
+                    .position(|focus| *focus == popup.focus)
+                    .unwrap_or(0);
+                let delta = if key == KeyCode::Up { -1 } else { 1 };
+                popup.focus = order[(index as isize + delta)
+                    .clamp(0, order.len() as isize - 1)
+                    as usize];
+                if popup.focus == SavedNetworksFocus::List
+                    && !popup.networks.is_empty()
+                {
+                    popup.selected = popup
+                        .selected
+                        .min(popup.networks.len().saturating_sub(1));
+                }
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                let index = order
+                    .iter()
+                    .position(|focus| *focus == popup.focus)
+                    .unwrap_or(0);
+                let delta = if key == KeyCode::BackTab { -1 } else { 1 };
+                popup.focus = order[(index as isize + delta)
+                    .rem_euclid(order.len() as isize)
+                    as usize];
+            }
+            KeyCode::Enter => match popup.focus {
+                SavedNetworksFocus::List => open_edit = true,
+                SavedNetworksFocus::Add => open_add = true,
+                SavedNetworksFocus::Edit => open_edit = true,
+                SavedNetworksFocus::Delete => delete = true,
+                SavedNetworksFocus::Back => back = true,
+            },
+            KeyCode::Esc => back = true,
+            _ => {}
+        }
+        if back {
+            self.popup = Popup::Editor(popup.parent);
+        } else if open_add {
+            self.open_access_point_editor(popup, None);
+        } else if open_edit {
+            let original = popup.networks.get(popup.selected).cloned();
+            if original.is_some() {
+                self.open_access_point_editor(popup, original);
+            } else {
+                self.popup = Popup::SavedNetworks(popup);
+            }
+        } else if delete {
+            self.delete_saved_network(client, popup);
+        } else {
+            self.popup = Popup::SavedNetworks(popup);
+        }
+    }
+
+    fn handle_access_point_key(
+        &mut self,
+        key: crossterm::event::KeyCode,
+        client: &mut DaemonClient,
+    ) {
+        use crossterm::event::KeyCode;
+        let popup = std::mem::replace(&mut self.popup, Popup::None);
+        let Popup::AccessPointEditor(mut popup) = popup else {
+            self.popup = popup;
+            return;
+        };
+        let mut cancel = false;
+        let mut save = false;
+        if popup.choice {
+            match key {
+                KeyCode::Up => {
+                    popup.choice_selected =
+                        popup.choice_selected.saturating_sub(1)
+                }
+                KeyCode::Down => {
+                    popup.choice_selected = (popup.choice_selected + 1).min(2)
+                }
+                KeyCode::Enter => popup.apply_security_choice(),
+                KeyCode::Esc => popup.choice = false,
+                _ => {}
+            }
+        } else if popup.footer {
+            match key {
+                KeyCode::Tab => popup.tab_focus(false),
+                KeyCode::BackTab => popup.tab_focus(true),
+                KeyCode::Left | KeyCode::Right => {
+                    popup.footer_selected = 1 - popup.footer_selected
+                }
+                KeyCode::Up => popup.footer = false,
+                KeyCode::Enter if popup.footer_selected == 0 => cancel = true,
+                KeyCode::Enter => save = true,
+                KeyCode::Esc => cancel = true,
+                _ => {}
+            }
+        } else {
+            match key {
+                KeyCode::Up | KeyCode::Down => {
+                    popup.move_focus(if key == KeyCode::Up { -1 } else { 1 });
+                }
+                KeyCode::Tab => popup.tab_focus(false),
+                KeyCode::BackTab => popup.tab_focus(true),
+                KeyCode::Left | KeyCode::Right
+                    if matches!(
+                        popup.focus,
+                        AccessPointFocus::Cancel | AccessPointFocus::Ok
+                    ) =>
+                {
+                    popup.focus = match popup.focus {
+                        AccessPointFocus::Cancel => AccessPointFocus::Ok,
+                        AccessPointFocus::Ok => AccessPointFocus::Cancel,
+                        _ => popup.focus,
+                    };
+                }
+                KeyCode::Char(' ') => popup.toggle(),
+                KeyCode::Char(character) => {
+                    if let Some(value) = popup.text_mut() {
+                        value.push(character);
+                    }
+                }
+                KeyCode::Backspace => {
+                    if let Some(value) = popup.text_mut() {
+                        value.pop();
+                    }
+                }
+                KeyCode::Enter => match popup.focus {
+                    AccessPointFocus::Security => popup.choice = true,
+                    AccessPointFocus::Hidden
+                    | AccessPointFocus::Autoconnect => popup.toggle(),
+                    _ => {}
+                },
+                KeyCode::Esc => cancel = true,
+                _ => {}
+            }
+        }
+        if cancel {
+            self.popup = Popup::SavedNetworks(*popup.parent);
+        } else if save {
+            self.save_access_point(client, popup);
+        } else {
+            self.popup = Popup::AccessPointEditor(popup);
+        }
+    }
+
     fn handle_popup_key(
         &mut self,
         key: crossterm::event::KeyCode,
@@ -2967,81 +4234,20 @@ impl App {
                     ));
                 }
             }
-            Popup::Password(popup) => {
-                let mut submit = None;
-                let mut cancel = false;
-                match key {
-                    KeyCode::Tab => {
-                        popup.focus = match popup.focus {
-                            PasswordFocus::Input => PasswordFocus::Show,
-                            PasswordFocus::Show => PasswordFocus::Cancel,
-                            PasswordFocus::Cancel => PasswordFocus::Connect,
-                            PasswordFocus::Connect => PasswordFocus::Input,
-                        };
-                    }
-                    KeyCode::BackTab => {
-                        popup.focus = match popup.focus {
-                            PasswordFocus::Input => PasswordFocus::Connect,
-                            PasswordFocus::Show => PasswordFocus::Input,
-                            PasswordFocus::Cancel => PasswordFocus::Show,
-                            PasswordFocus::Connect => PasswordFocus::Cancel,
-                        };
-                    }
-                    KeyCode::Left | KeyCode::Right
-                        if matches!(
-                            popup.focus,
-                            PasswordFocus::Cancel | PasswordFocus::Connect
-                        ) =>
-                    {
-                        popup.focus = match popup.focus {
-                            PasswordFocus::Cancel => PasswordFocus::Connect,
-                            PasswordFocus::Connect => PasswordFocus::Cancel,
-                            PasswordFocus::Input | PasswordFocus::Show => {
-                                popup.focus
-                            }
-                        };
-                    }
-                    KeyCode::Char(character)
-                        if popup.focus == PasswordFocus::Input =>
-                    {
-                        popup.input.push(character);
-                    }
-                    KeyCode::Backspace
-                        if popup.focus == PasswordFocus::Input =>
-                    {
-                        popup.input.pop();
-                    }
-                    KeyCode::Char(' ')
-                        if popup.focus == PasswordFocus::Show =>
-                    {
-                        popup.show = !popup.show
-                    }
-                    KeyCode::Enter => match popup.focus {
-                        PasswordFocus::Input => {
-                            popup.focus = PasswordFocus::Connect
-                        }
-                        PasswordFocus::Show => popup.show = !popup.show,
-                        PasswordFocus::Cancel => cancel = true,
-                        PasswordFocus::Connect => {
-                            submit = Some((
-                                popup.target.clone(),
-                                popup.input.clone(),
-                            ));
-                        }
-                    },
-                    KeyCode::Esc => cancel = true,
-                    _ => {}
-                }
-                if cancel {
-                    self.popup = Popup::None;
-                } else if let Some((target, password)) = submit {
-                    self.popup = Popup::None;
-                    self.start_wifi(client, target, Some(password));
-                }
+            Popup::BindBssid(_) => self.handle_bind_bssid_key(key, client),
+            Popup::WifiCredentials(_) => {
+                self.handle_wifi_credentials_key(key, client)
+            }
+            Popup::SavedNetworks(_) => {
+                self.handle_saved_networks_key(key, client)
+            }
+            Popup::AccessPointEditor(_) => {
+                self.handle_access_point_key(key, client)
             }
             Popup::Editor(editor) => {
                 let mut save = false;
                 let mut cancel = false;
+                let mut open_saved = false;
                 let mut close_routing = false;
                 let mut apply_routing = false;
                 if let Some(choice) = &mut editor.choice {
@@ -3160,6 +4366,8 @@ impl App {
                             {
                                 if field.is_routing() {
                                     editor.open_routing(field);
+                                } else if field == EditorField::SavedNetworks {
+                                    open_saved = true;
                                 } else if ConnectionEditor::choice_options(
                                     field,
                                 )
@@ -3199,6 +4407,11 @@ impl App {
                 }
                 if cancel {
                     self.popup = Popup::None;
+                } else if open_saved {
+                    let popup = std::mem::replace(&mut self.popup, Popup::None);
+                    if let Popup::Editor(editor) = popup {
+                        self.open_saved_networks(*editor);
+                    }
                 } else if save {
                     let popup = std::mem::replace(&mut self.popup, Popup::None);
                     if let Popup::Editor(editor) = popup {
@@ -3234,6 +4447,10 @@ impl App {
                 response: WiFiManagerResponse::Status(status),
                 ..
             }) if status.state == Some(WpaState::Completed) => {
+                self.wifi_by_interface
+                    .entry(target.iface.clone())
+                    .or_default()
+                    .status = Some(status.clone());
                 self.wifi_status = Some(status);
                 self.popup = Popup::None;
                 self.refresh_interfaces(client);
@@ -3277,7 +4494,16 @@ impl App {
             Popup::WirelessDevices(popup) => {
                 self.draw_wireless_devices(frame, area, popup)
             }
-            Popup::Password(popup) => self.draw_password(frame, area, popup),
+            Popup::BindBssid(popup) => self.draw_bind_bssid(frame, area, popup),
+            Popup::WifiCredentials(popup) => {
+                self.draw_wifi_credentials(frame, area, popup)
+            }
+            Popup::SavedNetworks(popup) => {
+                self.draw_saved_networks(frame, area, popup)
+            }
+            Popup::AccessPointEditor(popup) => {
+                self.draw_access_point_editor(frame, area, popup)
+            }
             Popup::Connecting(popup) => {
                 self.draw_connecting(frame, area, popup)
             }
@@ -3681,17 +4907,18 @@ impl App {
         );
     }
 
-    fn draw_password(
+    fn draw_bind_bssid(
         &self,
         frame: &mut Frame,
         area: Rect,
-        popup: &PasswordPopup,
+        popup: &BindBssidPopup,
     ) {
-        let rect = centered(area, 62, 12);
-        draw_frame(frame, rect, "Password Required");
+        let height = if popup.bind_bssid { 19 } else { 11 };
+        let rect = centered(area, 70, height);
+        draw_frame(frame, rect, "Connect to Access Point");
         let body = inner(rect);
         frame.render_widget(
-            Paragraph::new(format!("Password for {}", popup.target.ssid))
+            Paragraph::new("Bind this connection to a specific BSSID?")
                 .style(panel_style()),
             Rect {
                 x: body.x + 2,
@@ -3700,35 +4927,11 @@ impl App {
                 height: 1,
             },
         );
-        let password = if popup.show {
-            popup.input.clone()
-        } else {
-            "*".repeat(popup.input.chars().count())
-        };
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("Password                 ", label_style()),
-                Span::styled(
-                    format!(" {password:<38}"),
-                    if popup.focus == PasswordFocus::Input {
-                        selected_style()
-                    } else {
-                        field_style()
-                    },
-                ),
-            ])),
-            Rect {
-                x: body.x + 2,
-                y: body.y + 3,
-                width: body.width.saturating_sub(4),
-                height: 1,
-            },
-        );
-        let checked = if popup.show { "X" } else { " " };
+        let checked = if popup.bind_bssid { "X" } else { " " };
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                format!("[{checked}] Show password"),
-                if popup.focus == PasswordFocus::Show {
+                format!("[{checked}] Bind BSSID"),
+                if popup.focus == BindBssidFocus::Bind {
                     selected_style()
                 } else {
                     panel_style()
@@ -3736,26 +4939,365 @@ impl App {
             ))),
             Rect {
                 x: body.x + 2,
-                y: body.y + 5,
+                y: body.y + 3,
                 width: body.width.saturating_sub(4),
                 height: 1,
             },
         );
-        let footer = Rect {
-            x: body.x + 2,
-            y: body.bottom().saturating_sub(2),
-            width: body.width.saturating_sub(4),
-            height: 1,
+        if popup.bind_bssid {
+            let list_rect = Rect {
+                x: body.x + 2,
+                y: body.y + 5,
+                width: body.width.saturating_sub(18),
+                height: body.height.saturating_sub(8),
+            };
+            let items = if popup.target.candidates.is_empty() {
+                vec![ListItem::new("(no access points found)")]
+            } else {
+                popup
+                    .target
+                    .candidates
+                    .iter()
+                    .map(|candidate| {
+                        ListItem::new(format!(
+                            "{}  {}",
+                            candidate.bssid,
+                            signal_bars(candidate.signal)
+                        ))
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let mut state = ListState::default();
+            if popup.focus == BindBssidFocus::Candidate
+                && !popup.target.candidates.is_empty()
+            {
+                state.select(Some(
+                    popup
+                        .selected
+                        .min(popup.target.candidates.len().saturating_sub(1)),
+                ));
+            }
+            frame.render_stateful_widget(
+                List::new(items)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .style(panel_style()),
+                    )
+                    .highlight_style(selected_style())
+                    .highlight_symbol(""),
+                list_rect,
+                &mut state,
+            );
+        }
+        self.draw_buttons(
+            frame,
+            Rect {
+                x: body.right().saturating_sub(14),
+                y: body.y + 3,
+                width: 13,
+                height: body.height.saturating_sub(4),
+            },
+            &["Cancel", "Connect"],
+            match popup.focus {
+                BindBssidFocus::Cancel => 1,
+                BindBssidFocus::Connect => 2,
+                _ => 0,
+            },
+        );
+    }
+
+    fn draw_wifi_credentials(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        popup: &WifiCredentialsPopup,
+    ) {
+        let rect = centered(area, 70, 20);
+        draw_frame(frame, rect, "Wi-Fi Authentication");
+        let body = inner(rect);
+        let security_label = match popup.security {
+            Security::Open => "None",
+            Security::Psk => "WPA & WPA2 Personal",
+            Security::Eap => "WPA & WPA2 Enterprise",
+            Security::Unknown => "Select authentication",
         };
+        let mut lines = Vec::new();
+        if popup.hidden {
+            lines.push(credential_field_line(
+                "SSID",
+                &popup.ssid,
+                popup.focus == CredentialFocus::Ssid,
+            ));
+            lines.push(credential_field_line(
+                "BSSID (optional)",
+                &popup.bssid,
+                popup.focus == CredentialFocus::Bssid,
+            ));
+        }
+        lines.push(credential_selection_line(
+            "Security",
+            security_label,
+            popup.focus == CredentialFocus::Security,
+        ));
+        if popup.security == Security::Eap {
+            lines.push(credential_field_line(
+                "Identity",
+                &popup.identity,
+                popup.focus == CredentialFocus::Identity,
+            ));
+        }
+        if popup.security != Security::Open {
+            let password = if popup.password.is_empty() {
+                String::new()
+            } else if popup.show {
+                popup.password.clone()
+            } else {
+                "*".repeat(popup.password.chars().count())
+            };
+            lines.push(credential_field_line(
+                "Password",
+                &password,
+                popup.focus == CredentialFocus::Password,
+            ));
+        }
+        if popup.hidden {
+            let checked = if popup.hidden { "X" } else { " " };
+            lines.push(Line::from(Span::styled(
+                format!("[{checked}] Hidden network"),
+                if popup.focus == CredentialFocus::Hidden {
+                    selected_style()
+                } else {
+                    panel_style()
+                },
+            )));
+        }
+        if popup.security != Security::Open {
+            let checked = if popup.show { "X" } else { " " };
+            lines.push(Line::from(Span::styled(
+                format!("[{checked}] Show password"),
+                if popup.focus == CredentialFocus::Show {
+                    selected_style()
+                } else {
+                    panel_style()
+                },
+            )));
+        }
+        frame.render_widget(
+            Paragraph::new(lines).style(panel_style()),
+            Rect {
+                x: body.x + 2,
+                y: body.y + 2,
+                width: body.width.saturating_sub(4),
+                height: body.height.saturating_sub(6),
+            },
+        );
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                button_span("Cancel", popup.focus == PasswordFocus::Cancel),
+                button_span("Cancel", popup.focus == CredentialFocus::Cancel),
                 Span::raw(" "),
-                button_span("Connect", popup.focus == PasswordFocus::Connect),
+                button_span("Connect", popup.focus == CredentialFocus::Connect),
             ]))
             .alignment(Alignment::Right),
-            footer,
+            Rect {
+                x: body.x + 2,
+                y: body.bottom().saturating_sub(2),
+                width: body.width.saturating_sub(4),
+                height: 1,
+            },
         );
+        if popup.choice {
+            let options =
+                ["None", "WPA & WPA2 Personal", "WPA & WPA2 Enterprise"];
+            let choice_rect = centered(area, 38, 7);
+            draw_frame(frame, choice_rect, "Select Authentication");
+            let mut state = ListState::default();
+            state.select(Some(popup.choice_selected.min(2)));
+            frame.render_stateful_widget(
+                List::new(
+                    options.into_iter().map(ListItem::new).collect::<Vec<_>>(),
+                )
+                .highlight_style(selected_style())
+                .highlight_symbol(""),
+                inner(choice_rect),
+                &mut state,
+            );
+        }
+    }
+
+    fn draw_saved_networks(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        popup: &SavedNetworksPopup,
+    ) {
+        let rect = centered(area, 76, 22);
+        draw_frame(frame, rect, "Saved Networks");
+        let body = inner(rect);
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(72),
+                Constraint::Percentage(28),
+            ])
+            .split(body);
+        let items = if popup.networks.is_empty() {
+            vec![ListItem::new("(no saved networks)")]
+        } else {
+            popup
+                .networks
+                .iter()
+                .map(|network| {
+                    let bssid = network
+                        .bssid
+                        .map(|bssid| bssid.to_string())
+                        .unwrap_or_else(|| "any BSSID".to_string());
+                    ListItem::new(format!(
+                        "{}{}  {}  {}  {}",
+                        if network.is_current() { "* " } else { "  " },
+                        network.ssid,
+                        network.security,
+                        bssid,
+                        if network.autoconnect {
+                            "auto"
+                        } else {
+                            "manual"
+                        }
+                    ))
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut state = ListState::default();
+        if popup.focus == SavedNetworksFocus::List && !popup.networks.is_empty()
+        {
+            state.select(Some(
+                popup.selected.min(popup.networks.len().saturating_sub(1)),
+            ));
+        }
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(
+                    Block::default().borders(Borders::ALL).style(panel_style()),
+                )
+                .highlight_style(selected_style())
+                .highlight_symbol(""),
+            columns[0],
+            &mut state,
+        );
+        draw_scrollbar(frame, columns[0], popup.networks.len(), state.offset());
+        self.draw_buttons(
+            frame,
+            columns[1],
+            &["Add", "Edit", "Delete", "Back"],
+            popup.focus.index(),
+        );
+    }
+
+    fn draw_access_point_editor(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        popup: &AccessPointEditorPopup,
+    ) {
+        let rect = centered(area, 72, 23);
+        draw_frame(frame, rect, "Edit Saved Network");
+        let body = inner(rect);
+        let security = match popup.security {
+            Security::Open => "None",
+            Security::Psk => "WPA & WPA2 Personal",
+            Security::Eap => "WPA & WPA2 Enterprise",
+            Security::Unknown => "Select authentication",
+        };
+        let mut lines = vec![
+            ap_field_line(
+                "SSID",
+                &popup.ssid,
+                popup.focus == AccessPointFocus::Ssid,
+            ),
+            ap_field_line(
+                "BSSID (optional)",
+                &popup.bssid,
+                popup.focus == AccessPointFocus::Bssid,
+            ),
+            ap_selection_line(
+                "Security",
+                security,
+                popup.focus == AccessPointFocus::Security,
+            ),
+        ];
+        if popup.security == Security::Eap {
+            lines.push(ap_field_line(
+                "Identity",
+                &popup.identity,
+                popup.focus == AccessPointFocus::Identity,
+            ));
+        }
+        if popup.security != Security::Open {
+            let password = if popup.password.is_empty() {
+                "(unchanged)".to_string()
+            } else {
+                "*".repeat(popup.password.chars().count())
+            };
+            lines.push(ap_field_line(
+                "Password",
+                &password,
+                popup.focus == AccessPointFocus::Password,
+            ));
+        }
+        lines.push(ap_checkbox_line(
+            "Hidden network",
+            popup.hidden,
+            popup.focus == AccessPointFocus::Hidden,
+        ));
+        lines.push(ap_checkbox_line(
+            "Automatically connect",
+            popup.autoconnect,
+            popup.focus == AccessPointFocus::Autoconnect,
+        ));
+        frame.render_widget(
+            Paragraph::new(lines).style(panel_style()),
+            Rect {
+                x: body.x + 2,
+                y: body.y + 2,
+                width: body.width.saturating_sub(4),
+                height: body.height.saturating_sub(6),
+            },
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                button_span(
+                    "Cancel",
+                    popup.footer && popup.footer_selected == 0,
+                ),
+                Span::raw(" "),
+                button_span("OK", popup.footer && popup.footer_selected == 1),
+            ]))
+            .alignment(Alignment::Right),
+            Rect {
+                x: body.x + 2,
+                y: body.bottom().saturating_sub(2),
+                width: body.width.saturating_sub(4),
+                height: 1,
+            },
+        );
+        if popup.choice {
+            let choice_rect = centered(area, 40, 7);
+            draw_frame(frame, choice_rect, "Select Authentication");
+            let mut state = ListState::default();
+            state.select(Some(popup.choice_selected.min(2)));
+            frame.render_stateful_widget(
+                List::new(
+                    AccessPointEditorPopup::security_options()
+                        .into_iter()
+                        .map(ListItem::new)
+                        .collect::<Vec<_>>(),
+                )
+                .highlight_style(selected_style())
+                .highlight_symbol(""),
+                inner(choice_rect),
+                &mut state,
+            );
+        }
     }
 
     fn draw_connecting(
@@ -4076,6 +5618,90 @@ fn draw_scrollbar(
     );
 }
 
+fn credential_field_line(
+    label: &str,
+    value: &str,
+    selected: bool,
+) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label:<20}"), label_style()),
+        Span::styled(
+            format!(" {value:<38}"),
+            if selected {
+                selected_style()
+            } else {
+                field_style()
+            },
+        ),
+    ])
+}
+
+fn credential_selection_line(
+    label: &str,
+    value: &str,
+    selected: bool,
+) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label:<20}"), label_style()),
+        Span::styled(
+            format!(" <{value}>"),
+            if selected {
+                selected_style()
+            } else {
+                field_style()
+            },
+        ),
+    ])
+}
+
+fn ap_field_line(label: &str, value: &str, selected: bool) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label:<20}"), label_style()),
+        Span::styled(
+            format!(" {value:<42}"),
+            if selected {
+                selected_style()
+            } else {
+                field_style()
+            },
+        ),
+    ])
+}
+
+fn ap_selection_line(
+    label: &str,
+    value: &str,
+    selected: bool,
+) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label:<20}"), label_style()),
+        Span::styled(
+            format!(" <{value}>"),
+            if selected {
+                selected_style()
+            } else {
+                field_style()
+            },
+        ),
+    ])
+}
+
+fn ap_checkbox_line(
+    label: &str,
+    checked: bool,
+    selected: bool,
+) -> Line<'static> {
+    let mark = if checked { "X" } else { " " };
+    Line::from(Span::styled(
+        format!("[{mark}] {label}"),
+        if selected {
+            selected_style()
+        } else {
+            panel_style()
+        },
+    ))
+}
+
 fn signal_bars(signal: i32) -> &'static str {
     match signal.clamp(-90, -30) {
         -45..=-30 => "▂▄▆█",
@@ -4103,6 +5729,32 @@ mod tests {
         info.interface_type = InterfaceType::Ethernet;
         info.state = state;
         info
+    }
+
+    fn wlan(name: &str, state: ConnectionState, mac: &str) -> InterfaceInfo {
+        let mut info = ethernet(name, state);
+        info.interface_type = InterfaceType::Wlan;
+        info.mac_addr = Some(mac.parse().unwrap());
+        info
+    }
+
+    fn known(
+        ssid: &str,
+        security: Security,
+        bssid: Option<&str>,
+    ) -> KnownNetwork {
+        KnownNetwork {
+            id: None,
+            priority: 0,
+            hidden: false,
+            security,
+            state: libnetwork_daemon::KnownNetworkState::Enabled,
+            ssid: ssid.to_string(),
+            bssid: bssid.map(|value| value.parse().unwrap()),
+            password: None,
+            identity: None,
+            autoconnect: true,
+        }
     }
 
     fn render(app: &App) -> (String, bool) {
@@ -4175,6 +5827,44 @@ mod tests {
     }
 
     #[test]
+    fn edit_screen_lists_wifi_interfaces_not_saved_ssids() {
+        let app = App {
+            screen: Screen::EditConnections,
+            interfaces: vec![wlan(
+                "wlan0",
+                ConnectionState::Connected,
+                "02:00:00:00:00:01",
+            )],
+            known_networks: vec![known("Cafe", Security::Psk, None)],
+            ..App::default()
+        };
+        let (text, _) = render(&app);
+        assert!(text.contains("wlan0"));
+        assert!(!text.contains("Cafe"));
+    }
+
+    #[test]
+    fn wifi_interface_editor_exposes_saved_networks_action() {
+        let interface =
+            wlan("wlan0", ConnectionState::Disconnected, "02:00:00:00:00:01");
+        let editor = ConnectionEditor::from_interface_with_networks(
+            &interface,
+            vec![known("Cafe", Security::Psk, None)],
+        );
+        assert!(editor.fields().contains(&EditorField::SavedNetworks));
+        assert!(!editor.fields().contains(&EditorField::Ssid));
+        let app = App {
+            screen: Screen::EditConnections,
+            popup: Popup::Editor(Box::new(editor)),
+            ..App::default()
+        };
+        let (text, _) = render(&app);
+        assert!(text.contains("Saved Networks"));
+        assert!(text.contains("<Edit...>"));
+        assert!(!text.contains("Cafe"));
+    }
+
+    #[test]
     fn activation_screen_renders_groups_and_signal_bars() {
         let scan = ScanResult {
             freq: 2412,
@@ -4223,11 +5913,159 @@ mod tests {
                 ssid: Some("Home".to_string()),
                 ..SupplicantStatus::default()
             }),
-            activation_selected: 2,
+            activation_selected: 3,
             ..App::default()
         };
         let (text, _) = render(&app);
         assert!(text.contains("<Deactivate>"));
+    }
+
+    #[test]
+    fn activation_groups_by_interface_ssid_and_security() {
+        let mut first =
+            wlan("wlan0", ConnectionState::Disconnected, "02:00:00:00:00:01");
+        first.id = 1;
+        let mut second =
+            wlan("wlan1", ConnectionState::Disconnected, "02:00:00:00:00:02");
+        second.id = 2;
+        let scan =
+            |ssid: &str, security: Security, bssid: &str, signal| ScanResult {
+                freq: 2412,
+                signal,
+                bssid: bssid.parse().unwrap(),
+                ssid: ssid.to_string(),
+                security,
+                flags: Default::default(),
+            };
+        let app = App {
+            screen: Screen::ActivateConnections,
+            interfaces: vec![first, second],
+            wifi_by_interface: BTreeMap::from([
+                (
+                    "wlan0".to_string(),
+                    WifiInterfaceState {
+                        scan_results: vec![
+                            scan(
+                                "Office",
+                                Security::Psk,
+                                "aa:bb:cc:dd:ee:01",
+                                -60,
+                            ),
+                            scan(
+                                "Office",
+                                Security::Psk,
+                                "aa:bb:cc:dd:ee:02",
+                                -40,
+                            ),
+                            scan(
+                                "Office",
+                                Security::Eap,
+                                "aa:bb:cc:dd:ee:03",
+                                -50,
+                            ),
+                            scan("", Security::Open, "aa:bb:cc:dd:ee:04", -70),
+                        ],
+                        ..WifiInterfaceState::default()
+                    },
+                ),
+                (
+                    "wlan1".to_string(),
+                    WifiInterfaceState {
+                        scan_results: vec![scan(
+                            "Office",
+                            Security::Psk,
+                            "aa:bb:cc:dd:ee:05",
+                            -55,
+                        )],
+                        ..WifiInterfaceState::default()
+                    },
+                ),
+            ]),
+            ..App::default()
+        };
+        let rows = app.activation_rows();
+        let office_psk = rows
+            .iter()
+            .filter(|row| {
+                row.label.contains("Office") && row.label.contains("PSK")
+            })
+            .count();
+        assert_eq!(office_psk, 2);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.label.contains("Office")
+                    && row.label.contains("EAP"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.label.contains("<Hidden>"))
+                .count(),
+            1
+        );
+        let first_office = rows
+            .iter()
+            .find_map(|row| match &row.target {
+                Some(ActivationTarget::Wifi(target))
+                    if target.iface == "wlan0"
+                        && target.ssid == "Office"
+                        && target.security == Security::Psk =>
+                {
+                    Some(target)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(first_office.bssid.is_none());
+        assert_eq!(first_office.candidates.len(), 2);
+        assert_eq!(first_office.candidates[0].signal, -40);
+    }
+
+    #[test]
+    fn activation_starts_with_unbound_bssid_prompt() {
+        let target = WifiTarget {
+            iface: "wlan0".to_string(),
+            ssid: "Office".to_string(),
+            bssid: None,
+            security: Security::Psk,
+            hidden: false,
+            candidates: vec![ScanResult {
+                freq: 2412,
+                signal: -45,
+                bssid: "aa:bb:cc:dd:ee:ff".parse().unwrap(),
+                ssid: "Office".to_string(),
+                security: Security::Psk,
+                flags: Default::default(),
+            }],
+        };
+        let mut app = App::default();
+        app.open_wifi_connection(target);
+        let Popup::BindBssid(popup) = &app.popup else {
+            panic!("expected BSSID binding prompt");
+        };
+        assert!(!popup.bind_bssid);
+        assert_eq!(popup.focus, BindBssidFocus::Bind);
+    }
+
+    #[test]
+    fn unknown_security_opens_a_selectable_authentication_prompt() {
+        let target = WifiTarget {
+            iface: "wlan0".to_string(),
+            ssid: "Office".to_string(),
+            bssid: None,
+            security: Security::Unknown,
+            hidden: false,
+            candidates: Vec::new(),
+        };
+        let mut app = App::default();
+        let mut client = test_client();
+        app.start_wifi(&mut client, target, None, None);
+        let Popup::WifiCredentials(popup) = &app.popup else {
+            panic!("expected authentication prompt");
+        };
+        assert_eq!(popup.focus, CredentialFocus::Security);
+        assert!(popup.focus_order().contains(&CredentialFocus::Security));
     }
 
     #[test]
@@ -4995,7 +6833,7 @@ mod tests {
 
     #[test]
     fn editor_focus_fields_match_visible_wifi_controls() {
-        let mut editor = ConnectionEditor::from_wifi("wlan0", None, None);
+        let mut editor = ConnectionEditor::from_new_wifi("iwn0", "wlan0");
         let fields = editor.fields();
         assert_eq!(
             fields

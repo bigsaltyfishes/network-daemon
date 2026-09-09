@@ -109,6 +109,9 @@ pub enum WiFiManagerAction {
         identity: Option<String>,
         #[serde(default)]
         hidden: bool,
+        /// Whether the network should be enabled for automatic connection.
+        #[serde(default = "default_true")]
+        autoconnect: bool,
     },
     /// Remove a network
     ///
@@ -129,6 +132,9 @@ pub enum WiFiManagerAction {
     RemoveNetwork {
         ssid: String,
         bssid: Option<MacAddr>,
+        /// Security disambiguates equal SSIDs with different authentication.
+        #[serde(default)]
+        security: Option<Security>,
     },
     /// Connect to a stored known network
     ///
@@ -151,6 +157,9 @@ pub enum WiFiManagerAction {
     Connect {
         ssid: String,
         bssid: Option<MacAddr>,
+        /// Security disambiguates equal SSIDs with different authentication.
+        #[serde(default)]
+        security: Option<Security>,
     },
     /// Disconnect from current network
     ///
@@ -174,9 +183,16 @@ pub enum WiFiManagerAction {
     Reconnect,
     /// Subscribe to WiFi events
     SubscribeEvents,
+    /// Replace the daemon-side saved-network cache after loading persistence.
+    #[serde(skip)]
+    LoadNetworks { networks: Vec<KnownNetwork> },
     /// Internal event from wpa_supplicant
     #[serde(skip)]
     WpaEvent { event: WpaEvent },
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
