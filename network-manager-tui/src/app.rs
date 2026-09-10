@@ -680,12 +680,6 @@ enum EditorField {
     CreationMembers,
     CreationProtocol,
     VlanTag,
-    Ssid,
-    Bssid,
-    Security,
-    Identity,
-    Password,
-    Hidden,
     SavedNetworks,
     Ipv4Mode,
     ListValue(ListField, usize),
@@ -723,10 +717,6 @@ impl EditorField {
                 | Self::CreationParent
                 | Self::CreationMembers
                 | Self::VlanTag
-                | Self::Ssid
-                | Self::Bssid
-                | Self::Identity
-                | Self::Password
                 | Self::Ipv4Gateway
                 | Self::Ipv6Gateway
                 | Self::ListValue(..)
@@ -736,8 +726,7 @@ impl EditorField {
     fn is_bool(self) -> bool {
         matches!(
             self,
-            Self::Hidden
-                | Self::Slaac
+            Self::Slaac
                 | Self::Ipv4NeverDefault
                 | Self::Ipv4IgnoreRoutes
                 | Self::Ipv4IgnoreDns
@@ -962,12 +951,6 @@ pub struct ConnectionEditor {
     creation_vlan_tag: String,
     profile_name: String,
     device: String,
-    ssid: String,
-    bssid: String,
-    security: Security,
-    identity: String,
-    password: String,
-    hidden: bool,
     ipv4_mode: IpMode,
     ipv4_addresses: Vec<String>,
     ipv4_gateway: String,
@@ -991,7 +974,6 @@ pub struct ConnectionEditor {
     ipv6_required: bool,
     autoconnect: bool,
     available_users: bool,
-    existing_network: Option<(String, Option<MacAddr>, Security)>,
     saved_networks: Vec<KnownNetwork>,
     focus: usize,
     list_action: ListAction,
@@ -1027,12 +1009,6 @@ impl ConnectionEditor {
             creation_vlan_tag: String::new(),
             profile_name: iface.name.clone(),
             device: iface.name.clone(),
-            ssid: String::new(),
-            bssid: String::new(),
-            security: Security::Open,
-            identity: String::new(),
-            password: String::new(),
-            hidden: false,
             ipv4_mode: if iface.dhcpv4_enabled {
                 IpMode::Automatic
             } else {
@@ -1074,7 +1050,6 @@ impl ConnectionEditor {
             ipv6_required: false,
             autoconnect: true,
             available_users: true,
-            existing_network: None,
             saved_networks,
             focus: 0,
             list_action: ListAction::Value,
@@ -1085,84 +1060,9 @@ impl ConnectionEditor {
         }
     }
 
-    fn from_wifi(
-        iface: &str,
-        scan: Option<&ScanResult>,
-        known: Option<&KnownNetwork>,
-    ) -> Self {
-        let ssid = scan
-            .map(|network| network.ssid.clone())
-            .or_else(|| known.map(|network| network.ssid.clone()))
-            .unwrap_or_default();
-        let security = scan
-            .map(|network| network.security)
-            .or_else(|| known.map(|network| network.security))
-            .unwrap_or(Security::Open);
-        let bssid = scan
-            .map(|network| network.bssid.to_string())
-            .or_else(|| {
-                known
-                    .and_then(|network| network.bssid)
-                    .map(|address| address.to_string())
-            })
-            .unwrap_or_default();
-        Self {
-            mode: EditorMode::Wifi,
-            creation_kind: None,
-            creation_parent: String::new(),
-            creation_members: String::new(),
-            creation_protocol: LaggProtocol::default(),
-            creation_vlan_tag: String::new(),
-            profile_name: ssid.clone(),
-            device: iface.to_string(),
-            ssid,
-            bssid,
-            security,
-            identity: known
-                .and_then(|network| network.identity.clone())
-                .unwrap_or_default(),
-            password: known
-                .and_then(|network| network.password.clone())
-                .unwrap_or_default(),
-            hidden: known.is_some_and(|network| network.hidden),
-            ipv4_mode: IpMode::Automatic,
-            ipv4_addresses: Vec::new(),
-            ipv4_gateway: String::new(),
-            ipv4_dns: Vec::new(),
-            ipv4_search: Vec::new(),
-            ipv4_routes: Vec::new(),
-            ipv4_never_default: false,
-            ipv4_ignore_routes: false,
-            ipv4_ignore_dns: false,
-            ipv4_required: false,
-            ipv6_mode: IpMode::Automatic,
-            slaac: true,
-            ipv6_addresses: Vec::new(),
-            ipv6_gateway: String::new(),
-            ipv6_dns: Vec::new(),
-            ipv6_search: Vec::new(),
-            ipv6_routes: Vec::new(),
-            ipv6_never_default: false,
-            ipv6_ignore_routes: false,
-            ipv6_ignore_dns: false,
-            ipv6_required: false,
-            autoconnect: known.is_none_or(KnownNetwork::is_enabled),
-            available_users: true,
-            existing_network: known.map(|network| {
-                (network.ssid.clone(), network.bssid, network.security)
-            }),
-            saved_networks: Vec::new(),
-            focus: 0,
-            list_action: ListAction::Value,
-            footer: false,
-            footer_selected: 0,
-            choice: None,
-            routing: None,
-        }
-    }
-
     fn from_new_wifi(parent: &str, iface: &str) -> Self {
-        let mut editor = Self::from_wifi(iface, None, None);
+        let mut editor = Self::from_interface(&InterfaceInfo::new(0, iface));
+        editor.mode = EditorMode::Wifi;
         editor.creation_kind = Some(InterfaceType::Wlan);
         editor.creation_parent = parent.to_string();
         editor
@@ -1180,7 +1080,11 @@ impl ConnectionEditor {
     }
 
     fn fields(&self) -> Vec<EditorField> {
-        let mut fields = vec![EditorField::ProfileName, EditorField::Device];
+        let mut fields = if self.creation_kind == Some(InterfaceType::Wlan) {
+            vec![EditorField::Device]
+        } else {
+            vec![EditorField::ProfileName, EditorField::Device]
+        };
         match self.creation_kind {
             Some(InterfaceType::Wlan) => {
                 fields.push(EditorField::CreationParent);
@@ -1199,23 +1103,8 @@ impl ConnectionEditor {
             }
             Some(_) | None => {}
         }
-        if self.mode == EditorMode::Wifi {
-            if self.creation_kind.is_none() {
-                fields.push(EditorField::SavedNetworks);
-            } else {
-                fields.extend([
-                    EditorField::Ssid,
-                    EditorField::Bssid,
-                    EditorField::Security,
-                ]);
-                if self.security == Security::Eap {
-                    fields.push(EditorField::Identity);
-                }
-                if self.security != Security::Open {
-                    fields.push(EditorField::Password);
-                }
-                fields.push(EditorField::Hidden);
-            }
+        if self.mode == EditorMode::Wifi && self.creation_kind.is_none() {
+            fields.push(EditorField::SavedNetworks);
         }
         fields.extend([EditorField::Ipv4Mode]);
         fields.extend(self.list_fields(ListField::Ipv4Addresses));
@@ -1268,12 +1157,6 @@ impl ConnectionEditor {
             EditorField::CreationMembers => "Member devices",
             EditorField::CreationProtocol => "LAGG protocol",
             EditorField::VlanTag => "VLAN ID",
-            EditorField::Ssid => "SSID",
-            EditorField::Bssid => "BSSID",
-            EditorField::Security => "Security",
-            EditorField::Identity => "Identity",
-            EditorField::Password => "Password",
-            EditorField::Hidden => "Hidden network",
             EditorField::SavedNetworks => "Saved Networks",
             EditorField::Ipv4Mode => "IPv4 CONFIGURATION",
             EditorField::ListValue(kind, _) | EditorField::ListAdd(kind) => {
@@ -1343,10 +1226,6 @@ impl ConnectionEditor {
             EditorField::CreationParent => &self.creation_parent,
             EditorField::CreationMembers => &self.creation_members,
             EditorField::VlanTag => &self.creation_vlan_tag,
-            EditorField::Ssid => &self.ssid,
-            EditorField::Bssid => &self.bssid,
-            EditorField::Identity => &self.identity,
-            EditorField::Password => &self.password,
             EditorField::Ipv4Gateway => &self.ipv4_gateway,
             EditorField::Ipv6Gateway => &self.ipv6_gateway,
             EditorField::ListValue(kind, index) => self
@@ -1365,10 +1244,6 @@ impl ConnectionEditor {
             EditorField::CreationParent => Some(&mut self.creation_parent),
             EditorField::CreationMembers => Some(&mut self.creation_members),
             EditorField::VlanTag => Some(&mut self.creation_vlan_tag),
-            EditorField::Ssid => Some(&mut self.ssid),
-            EditorField::Bssid => Some(&mut self.bssid),
-            EditorField::Identity => Some(&mut self.identity),
-            EditorField::Password => Some(&mut self.password),
             EditorField::Ipv4Gateway => Some(&mut self.ipv4_gateway),
             EditorField::Ipv6Gateway => Some(&mut self.ipv6_gateway),
             EditorField::ListValue(kind, index) => {
@@ -1380,7 +1255,6 @@ impl ConnectionEditor {
 
     fn bool_value(&self, field: EditorField) -> bool {
         match field {
-            EditorField::Hidden => self.hidden,
             EditorField::Slaac => self.slaac,
             EditorField::Ipv4NeverDefault => self.ipv4_never_default,
             EditorField::Ipv4IgnoreRoutes => self.ipv4_ignore_routes,
@@ -1398,7 +1272,6 @@ impl ConnectionEditor {
 
     fn toggle(&mut self, field: EditorField) {
         match field {
-            EditorField::Hidden => self.hidden = !self.hidden,
             EditorField::Slaac => self.slaac = !self.slaac,
             EditorField::Ipv4NeverDefault => {
                 self.ipv4_never_default = !self.ipv4_never_default
@@ -1434,12 +1307,6 @@ impl ConnectionEditor {
 
     fn choice_options(field: EditorField) -> Option<Vec<String>> {
         match field {
-            EditorField::Security => Some(
-                ["None", "WPA & WPA2 Personal", "WPA & WPA2 Enterprise"]
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
-            ),
             EditorField::CreationProtocol => Some(
                 [
                     "failover",
@@ -1465,12 +1332,6 @@ impl ConnectionEditor {
 
     fn choice_selected(&self, field: EditorField, options: &[String]) -> usize {
         let value = match field {
-            EditorField::Security => match self.security {
-                Security::Open => "None",
-                Security::Psk => "WPA & WPA2 Personal",
-                Security::Eap => "WPA & WPA2 Enterprise",
-                Security::Unknown => "None",
-            },
             EditorField::CreationProtocol => {
                 Self::lagg_protocol_label(self.creation_protocol)
             }
@@ -1489,13 +1350,6 @@ impl ConnectionEditor {
             return;
         };
         match choice.field {
-            EditorField::Security => {
-                self.security = match choice.selected {
-                    1 => Security::Psk,
-                    2 => Security::Eap,
-                    _ => Security::Open,
-                };
-            }
             EditorField::CreationProtocol => {
                 self.creation_protocol = match choice.selected {
                     1 => LaggProtocol::Lacp,
@@ -1663,15 +1517,6 @@ impl ConnectionEditor {
     fn field_line(&self, field: EditorField) -> Line<'static> {
         let label = Self::field_label(field);
         let value = self.text_value(field);
-        let display = if field == EditorField::Password {
-            if value.is_empty() {
-                String::new()
-            } else {
-                "*".repeat(value.chars().count())
-            }
-        } else {
-            value.to_string()
-        };
         let value_style = if self.focused(field) {
             selected_style()
         } else {
@@ -1679,7 +1524,7 @@ impl ConnectionEditor {
         };
         Line::from(vec![
             Span::styled(format!("{label:<20}"), label_style()),
-            Span::styled(format!(" {display:<30}"), value_style),
+            Span::styled(format!(" {value:<30}"), value_style),
         ])
     }
 
@@ -1800,10 +1645,12 @@ impl ConnectionEditor {
                 rows.push((Some($field), $line));
             };
         }
-        push_field!(
-            EditorField::ProfileName,
-            self.field_line(EditorField::ProfileName),
-        );
+        if self.creation_kind != Some(InterfaceType::Wlan) {
+            push_field!(
+                EditorField::ProfileName,
+                self.field_line(EditorField::ProfileName),
+            );
+        }
         push_field!(EditorField::Device, self.field_line(EditorField::Device));
         if let Some(kind) = self.creation_kind {
             rows.push((None, Line::from("")));
@@ -1860,56 +1707,17 @@ impl ConnectionEditor {
                 _ => {}
             }
         }
-        if self.mode == EditorMode::Wifi {
+        if self.mode == EditorMode::Wifi && self.creation_kind.is_none() {
             rows.push((None, Line::from("")));
             rows.push((
                 None,
                 Line::from(Span::styled("- WI-FI", section_style())),
             ));
-            if self.creation_kind.is_none() {
-                push_field!(
-                    EditorField::SavedNetworks,
-                    self.selection_line(EditorField::SavedNetworks, "Edit..."),
-                );
-            } else {
-                push_field!(
-                    EditorField::Ssid,
-                    self.field_line(EditorField::Ssid),
-                );
-                push_field!(
-                    EditorField::Bssid,
-                    self.field_line(EditorField::Bssid)
-                );
-                push_field!(
-                    EditorField::Security,
-                    self.selection_line(
-                        EditorField::Security,
-                        match self.security {
-                            Security::Open => "None",
-                            Security::Psk => "WPA & WPA2 Personal",
-                            Security::Eap => "WPA & WPA2 Enterprise",
-                            Security::Unknown => "None",
-                        },
-                    ),
-                );
-                if self.security == Security::Eap {
-                    push_field!(
-                        EditorField::Identity,
-                        self.field_line(EditorField::Identity),
-                    );
-                }
-                if self.security != Security::Open {
-                    push_field!(
-                        EditorField::Password,
-                        self.field_line(EditorField::Password),
-                    );
-                }
-                push_field!(
-                    EditorField::Hidden,
-                    self.checkbox_line(EditorField::Hidden),
-                );
-            }
-        } else {
+            push_field!(
+                EditorField::SavedNetworks,
+                self.selection_line(EditorField::SavedNetworks, "Edit..."),
+            );
+        } else if self.mode != EditorMode::Wifi {
             rows.push((
                 None,
                 Line::from(Span::styled("- ETHERNET", section_style())),
@@ -2203,38 +2011,6 @@ impl ConnectionEditor {
             LaggProtocol::Broadcast => "broadcast",
             LaggProtocol::None => "none",
         }
-    }
-
-    fn wifi_values(
-        &self,
-    ) -> Result<(String, Option<MacAddr>, Security), String> {
-        let ssid = self.ssid.trim().to_string();
-        if ssid.is_empty() {
-            return Err("SSID must not be empty".to_string());
-        }
-        let bssid =
-            if self.bssid.trim().is_empty() {
-                None
-            } else {
-                Some(self.bssid.trim().parse().map_err(|_| {
-                    "BSSID must be aa:bb:cc:dd:ee:ff".to_string()
-                })?)
-            };
-        match self.security {
-            Security::Psk if !(8..=63).contains(&self.password.len()) => {
-                return Err(
-                    "WPA-PSK password must contain 8-63 bytes".to_string()
-                );
-            }
-            Security::Eap if self.identity.trim().is_empty() => {
-                return Err("EAP identity must not be empty".to_string());
-            }
-            Security::Eap if self.password.is_empty() => {
-                return Err("EAP password must not be empty".to_string());
-            }
-            _ => {}
-        }
-        Ok((ssid, bssid, self.security))
     }
 }
 
@@ -3249,13 +3025,6 @@ impl App {
                     self.refresh_wifi(client, false);
                     return;
                 }
-                let (ssid, bssid, security) = match editor.wifi_values() {
-                    Ok(values) => values,
-                    Err(error) => {
-                        self.show_message("Invalid connection", error);
-                        return;
-                    }
-                };
                 let iface = editor.device.trim().to_string();
                 if iface.is_empty() {
                     self.show_message(
@@ -3264,16 +3033,12 @@ impl App {
                     );
                     return;
                 }
-                let creation_actions = if editor.creation_kind.is_some() {
-                    Some(match editor.interface_actions(iface.clone()) {
-                        Ok(actions) => actions,
-                        Err(error) => {
-                            self.show_message("Invalid connection", error);
-                            return;
-                        }
-                    })
-                } else {
-                    None
+                let actions = match editor.interface_actions(iface.clone()) {
+                    Ok(actions) => actions,
+                    Err(error) => {
+                        self.show_message("Invalid connection", error);
+                        return;
+                    }
                 };
                 if let Some(kind) = editor.creation_kind {
                     let options = match editor.creation_options() {
@@ -3318,66 +3083,15 @@ impl App {
                     }
                     self.wifi_iface = Some(iface.clone());
                 }
-                if let Some((old_ssid, old_bssid, old_security)) =
-                    editor.existing_network.clone()
-                {
-                    let remove = DaemonCommand::WiFiManager {
-                        iface: iface.clone(),
-                        action: WiFiManagerAction::RemoveNetwork {
-                            ssid: old_ssid,
-                            bssid: old_bssid,
-                            security: Some(old_security),
-                        },
-                    };
-                    if let Err(error) = self.request(client, &remove) {
-                        self.show_error("Update connection failed", error);
+                for action in actions {
+                    let command = DaemonCommand::InterfaceManager { action };
+                    if let Err(error) = self.request(client, &command) {
+                        self.show_error("Save connection failed", error);
                         return;
                     }
                 }
-                let add = DaemonCommand::WiFiManager {
-                    iface: iface.clone(),
-                    action: WiFiManagerAction::AddNetwork {
-                        ssid,
-                        bssid,
-                        security,
-                        password: if editor.password.is_empty() {
-                            None
-                        } else {
-                            Some(editor.password.clone())
-                        },
-                        identity: if editor.identity.is_empty() {
-                            None
-                        } else {
-                            Some(editor.identity.clone())
-                        },
-                        hidden: editor.hidden,
-                        autoconnect: editor.autoconnect,
-                    },
-                };
-                match self.request(client, &add) {
-                    Ok(_) => {
-                        if let Some(actions) = creation_actions {
-                            for action in actions {
-                                let command =
-                                    DaemonCommand::InterfaceManager { action };
-                                if let Err(error) =
-                                    self.request(client, &command)
-                                {
-                                    self.show_error(
-                                        "Save connection failed",
-                                        error,
-                                    );
-                                    return;
-                                }
-                            }
-                        }
-                        self.popup = Popup::None;
-                        self.refresh_wifi(client, false);
-                    }
-                    Err(error) => {
-                        self.show_error("Save connection failed", error)
-                    }
-                }
+                self.popup = Popup::None;
+                self.refresh_wifi(client, false);
             }
         }
     }
@@ -3758,14 +3472,16 @@ impl App {
                     .rem_euclid(order.len() as isize)
                     as usize];
             }
-            KeyCode::Enter | KeyCode::Char(' ') => match popup.focus {
-                BindBssidFocus::Bind => {
-                    popup.bind_bssid = !popup.bind_bssid;
-                    if !popup.bind_bssid {
-                        popup.focus = BindBssidFocus::Bind;
-                    }
+            KeyCode::Char(' ') if popup.focus == BindBssidFocus::Bind => {
+                popup.bind_bssid = !popup.bind_bssid;
+                if !popup.bind_bssid {
+                    popup.focus = BindBssidFocus::Bind;
                 }
-                BindBssidFocus::Candidate => {}
+            }
+            KeyCode::Enter => match popup.focus {
+                BindBssidFocus::Bind | BindBssidFocus::Candidate => {
+                    connect = true
+                }
                 BindBssidFocus::Cancel => close = true,
                 BindBssidFocus::Connect => connect = true,
             },
@@ -4141,7 +3857,7 @@ impl App {
                         };
                     }
                     KeyCode::Enter => match popup.focus {
-                        NewFocus::List => popup.focus = NewFocus::Create,
+                        NewFocus::List => create = Some(popup.selected),
                         NewFocus::Cancel => cancel = true,
                         NewFocus::Create => create = Some(popup.selected),
                     },
@@ -4215,7 +3931,7 @@ impl App {
                     }
                     KeyCode::Enter => match popup.focus {
                         WirelessDeviceFocus::List => {
-                            popup.focus = WirelessDeviceFocus::Select
+                            parent = popup.devices.get(popup.selected).cloned();
                         }
                         WirelessDeviceFocus::Cancel => cancel = true,
                         WirelessDeviceFocus::Select => {
@@ -5852,7 +5568,6 @@ mod tests {
             vec![known("Cafe", Security::Psk, None)],
         );
         assert!(editor.fields().contains(&EditorField::SavedNetworks));
-        assert!(!editor.fields().contains(&EditorField::Ssid));
         let app = App {
             screen: Screen::EditConnections,
             popup: Popup::Editor(Box::new(editor)),
@@ -6049,6 +5764,60 @@ mod tests {
     }
 
     #[test]
+    fn bssid_prompt_uses_space_to_bind_and_enter_to_continue() {
+        let target = WifiTarget {
+            iface: "wlan0".to_string(),
+            ssid: "Office".to_string(),
+            bssid: None,
+            security: Security::Psk,
+            hidden: false,
+            candidates: vec![ScanResult {
+                freq: 2412,
+                signal: -45,
+                bssid: "aa:bb:cc:dd:ee:ff".parse().unwrap(),
+                ssid: "Office".to_string(),
+                security: Security::Psk,
+                flags: Default::default(),
+            }],
+        };
+        let mut app = App::default();
+        let mut client = test_client();
+        app.open_wifi_connection(target.clone());
+        app.handle_key(crossterm::event::KeyCode::Char(' '), &mut client);
+        let Popup::BindBssid(popup) = &app.popup else {
+            panic!("expected BSSID binding prompt");
+        };
+        assert!(popup.bind_bssid);
+        assert_eq!(popup.focus, BindBssidFocus::Bind);
+
+        let mut direct = App::default();
+        direct.open_wifi_connection(target);
+        direct.handle_key(crossterm::event::KeyCode::Char(' '), &mut client);
+        direct.handle_key(crossterm::event::KeyCode::Enter, &mut client);
+        let Popup::WifiCredentials(popup) = &direct.popup else {
+            panic!("expected Wi-Fi credentials popup");
+        };
+        assert_eq!(
+            popup.target.bssid,
+            Some("aa:bb:cc:dd:ee:ff".parse().unwrap())
+        );
+
+        app.handle_key(crossterm::event::KeyCode::Down, &mut client);
+        let Popup::BindBssid(popup) = &app.popup else {
+            panic!("expected BSSID binding prompt");
+        };
+        assert_eq!(popup.focus, BindBssidFocus::Candidate);
+        app.handle_key(crossterm::event::KeyCode::Enter, &mut client);
+        let Popup::WifiCredentials(popup) = &app.popup else {
+            panic!("expected Wi-Fi credentials popup");
+        };
+        assert_eq!(
+            popup.target.bssid,
+            Some("aa:bb:cc:dd:ee:ff".parse().unwrap())
+        );
+    }
+
+    #[test]
     fn unknown_security_opens_a_selectable_authentication_prompt() {
         let target = WifiTarget {
             iface: "wlan0".to_string(),
@@ -6191,6 +5960,24 @@ mod tests {
         assert!(text.contains("<Cancel>"));
         assert!(text.contains("<Create>"));
         assert!(highlighted);
+    }
+
+    #[test]
+    fn new_connection_type_enter_opens_editor_immediately() {
+        let mut app = App {
+            screen: Screen::EditConnections,
+            popup: Popup::NewConnection(NewConnectionPopup {
+                selected: 1,
+                focus: NewFocus::List,
+            }),
+            ..App::default()
+        };
+        let mut client = test_client();
+        app.handle_key(crossterm::event::KeyCode::Enter, &mut client);
+        let Popup::Editor(editor) = app.popup else {
+            panic!("expected creation editor popup");
+        };
+        assert_eq!(editor.creation_kind, Some(InterfaceType::Lagg));
     }
 
     #[test]
@@ -6478,12 +6265,6 @@ mod tests {
     }
 
     #[test]
-    fn editor_validates_wifi_credentials() {
-        let editor = ConnectionEditor::from_wifi("wlan0", None, None);
-        assert!(editor.wifi_values().is_err());
-    }
-
-    #[test]
     fn new_wifi_connection_selects_device_before_editing() {
         let socket = std::env::temp_dir().join(format!(
             "network-daemon-tui-wifi-{}-{}.sock",
@@ -6528,12 +6309,12 @@ mod tests {
         };
         assert_eq!(popup.devices, ["iwn0"]);
         app.handle_key(crossterm::event::KeyCode::Enter, &mut client);
-        app.handle_key(crossterm::event::KeyCode::Enter, &mut client);
         let Popup::Editor(editor) = &app.popup else {
             panic!("expected Wi-Fi editor popup");
         };
         assert_eq!(editor.device, "wlan0");
         assert_eq!(editor.creation_parent, "iwn0");
+        assert!(!editor.fields().contains(&EditorField::ProfileName));
         server.join().unwrap();
         let _ = std::fs::remove_file(socket);
     }
@@ -6759,24 +6540,6 @@ mod tests {
 
             assert!(matches!(
                 next_command(),
-                DaemonCommand::WiFiManager {
-                    iface,
-                    action: WiFiManagerAction::AddNetwork { ssid, .. },
-                } if iface == "wlan0" && ssid == "Cafe"
-            ));
-            writeln!(
-                stream,
-                "{}",
-                serde_json::to_string(&DaemonResponse::WiFiManager {
-                    iface: "wlan0".to_string(),
-                    response: WiFiManagerResponse::Success(()),
-                })
-                .unwrap()
-            )
-            .unwrap();
-
-            assert!(matches!(
-                next_command(),
                 DaemonCommand::InterfaceManager {
                     action: InterfaceManagerAction::ModLink { .. },
                 }
@@ -6817,15 +6580,12 @@ mod tests {
         let mut app = App::default();
         app.create_connection(&mut client, 0);
         app.handle_key(crossterm::event::KeyCode::Enter, &mut client);
-        app.handle_key(crossterm::event::KeyCode::Enter, &mut client);
         let Popup::Editor(editor) =
             std::mem::replace(&mut app.popup, Popup::None)
         else {
             panic!("expected Wi-Fi editor popup");
         };
-        let mut editor = *editor;
-        editor.ssid = "Cafe".to_string();
-        app.save_editor(&mut client, editor);
+        app.save_editor(&mut client, *editor);
         assert!(matches!(app.popup, Popup::None));
         server.join().unwrap();
         let _ = std::fs::remove_file(socket);
@@ -6833,15 +6593,9 @@ mod tests {
 
     #[test]
     fn editor_focus_fields_match_visible_wifi_controls() {
-        let mut editor = ConnectionEditor::from_new_wifi("iwn0", "wlan0");
+        let editor = ConnectionEditor::from_new_wifi("iwn0", "wlan0");
         let fields = editor.fields();
-        assert_eq!(
-            fields
-                .iter()
-                .filter(|field| **field == EditorField::ProfileName)
-                .count(),
-            1
-        );
+        assert!(!fields.contains(&EditorField::ProfileName));
         assert_eq!(
             fields
                 .iter()
@@ -6849,18 +6603,22 @@ mod tests {
                 .count(),
             1
         );
-        assert!(!fields.contains(&EditorField::Identity));
-        assert!(!fields.contains(&EditorField::Password));
-
-        editor.security = Security::Psk;
-        let fields = editor.fields();
-        assert!(!fields.contains(&EditorField::Identity));
-        assert!(fields.contains(&EditorField::Password));
-
-        editor.security = Security::Eap;
-        let fields = editor.fields();
-        assert!(fields.contains(&EditorField::Identity));
-        assert!(fields.contains(&EditorField::Password));
+        assert!(!fields.contains(&EditorField::SavedNetworks));
+        let text = editor
+            .form_rows()
+            .iter()
+            .flat_map(|(_, line)| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        for label in [
+            "Profile name",
+            "SSID",
+            "BSSID",
+            "Security",
+            "Hidden network",
+        ] {
+            assert!(!text.contains(label), "unexpected {label}");
+        }
     }
 
     #[test]
